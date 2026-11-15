@@ -23,6 +23,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -44,6 +45,7 @@ constexpr uintptr_t kCreateSound = 0x27BE3F0;   // FMOD::System::createSound(sys
 constexpr uintptr_t kStudioPlay  = 0x29823B0;   // Studio's sound-instrument player (snd, sys, group, paused, a5, channel**)
 constexpr uintptr_t kPlaySound   = 0x27BFA40;   // FMOD::System::playSound(sys, sound, group, paused, channel**)
 constexpr uintptr_t kSetVolume = 0x27C3450, kSetPitch = 0x27C3160;   // ChannelControl::setVolume / setPitch (as the Anti-Lag mod uses them)
+constexpr uintptr_t kSynthRead   = 0x1948A30;   // the read callback of the game's "PG Engine Synth" DSP (granular engines)
 constexpr uintptr_t kCreateDspDesc = 0x27BDF70; // FMOD::System::createDSP(sys, const FMOD_DSP_DESCRIPTION*, dsp**)
 constexpr uintptr_t kCreateDsp   = 0x27BE190;   // FMOD::System::createDSPByType(sys, type, dsp**)
 constexpr uintptr_t kAddDsp      = 0x27C1910;   // FMOD::ChannelControl::addDSP(cc, index, dsp)
@@ -57,7 +59,7 @@ constexpr int kDspEcho = 6, kDspDistortion = 9, kDspThreeEq = 28;   // FMOD_DSP_
 struct Sig { uintptr_t rva; unsigned char b[6]; };
 const Sig kSigs[] = {
     {kCreateSound, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kStudioPlay, {0x48, 0x89, 0x5c, 0x24, 0x10, 0x48}},
-    {kPlaySound, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kCreateDspDesc, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kCreateDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},   {kAddDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},
+    {kPlaySound, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kSynthRead, {0x4C, 0x8B, 0xDC, 0x57, 0x41, 0x54}}, {kCreateDspDesc, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kCreateDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},   {kAddDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},
     {kGetDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},      {kSetFloat, {0x40, 0x53, 0x55, 0x56, 0x48, 0x81}},
     {kHud, {0x40, 0x57, 0x48, 0x83, 0xec, 0x20}},
 };
@@ -202,11 +204,24 @@ struct Made { int row; uint32_t idx; };
 std::mutex g_mu;
 std::unordered_map<void*, Made> g_made;
 
+std::unordered_set<void*> g_pop;          // sounds the Anti-Lag mod made (its pop samples), guarded by g_mu
+HMODULE g_antilag_mod = nullptr;
 std::unordered_map<void*, int> g_user;   // sounds that are fed by a PCM callback (the granular engine synth), guarded by g_mu
 std::atomic<int> g_user_logged{0};
 
 int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex, void** out) {
+    void* const ra = __builtin_return_address(0);
     const int r = g_orig_create(sys, name, mode, ex, out);
+    if (r == 0 && out && *out && g_antilag_mod) {   // made by the Anti-Lag mod: one of its pop samples
+        HMODULE m = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(ra), &m) && m == g_antilag_mod) {
+            std::scoped_lock lk{g_mu};
+            g_pop.insert(*out);
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 3) say("an Anti-Lag pop sample noted");
+            return r;
+        }
+    }
     if (r != 0 || !out || !ex || !*out) return r;
     if (mode & 0x200) {   // FMOD_OPENUSER
         int cb0 = 0, nch = 0, freq = 0, fmt = 0;
@@ -243,6 +258,7 @@ int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex,
 // Pops: the Anti-Lag mod owns their sound while it is installed (its own sample plays in their place); we only add extra ones then.
 bool g_antilag = false;
 int classify(void* snd, int* row) {
+    if (g_pop.count(snd)) { *row = g_bank_pg.load(); return 4; }
     auto it = g_made.find(snd);
     if (it == g_made.end()) {
         void* parent = nullptr;
@@ -346,7 +362,7 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
 typedef int (*CreateDspDescFn)(void*, const void*, void**);
 Dsp* make_dsp(void* sys, void** dsp_out) {
     unsigned char desc[0xD8] = {};
-    *reinterpret_cast<unsigned*>(desc + 0x00) = 100;                 // pluginsdkversion
+    *reinterpret_cast<unsigned*>(desc + 0x00) = 108;                 // pluginsdkversion (what the game's own plugin descriptions say)
     memcpy(desc + 4, "EngineSoundTiers", 17);                        // name[32]
     *reinterpret_cast<unsigned*>(desc + 0x24) = 0x00010000;          // version
     *reinterpret_cast<int*>(desc + 0x28) = 1;                        // numinputbuffers
@@ -367,6 +383,47 @@ Dsp* make_dsp(void* sys, void** dsp_out) {
 struct Dp { float k, drive, mix, bias, gain_db; };
 const Dp kExhDp[4] = {{0, 1, 0, 0, 0}, {0.12f, 1.5f, 0.10f, 0.10f, 0}, {0.40f, 2.5f, 0.28f, 0.20f, 1.0f}, {0.80f, 3.0f, 0.55f, 0.30f, 1.5f}};
 const Dp kIntDp[4] = {{0, 1, 0, 0, 0}, {0.05f, 1.5f, 0.05f, 0.10f, 0}, {0.20f, 2.0f, 0.15f, 0.15f, 0.5f}, {0.45f, 3.0f, 0.35f, 0.25f, 1.0f}};
+
+// ---- the granular engine synth ---------------------------------------------------------------------------------------------------
+// The 50 granular cars' main engine sound is made by an FMOD DSP the game registers itself, "PG Engine Synth" (a static description in the
+// exe: read callback game+0x1948A30). It generates the sound into `out`; we run the original and then shape that buffer: the same pulse
+// emphasis and rasp as above plus a three-band tilt, with the level of the driven car's exhaust and intake mixed (the synth makes both).
+typedef int (*SynthReadFn)(void*, float*, float*, unsigned, int, int*);
+SynthReadFn g_orig_synth = nullptr;
+
+struct Blk {   // everything process_block needs, per call
+    float k, drive, mix, bias, gain, lg, mg, hg, x1, x2, limit;
+};
+struct Inst { void* key = nullptr; uint64_t last = 0; Dsp d; float l1[8] = {}, l2[8] = {}; };
+Inst g_inst[16];
+
+void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) {
+    static const float af = 1.0f - std::exp(-1.0f / (0.0007f * kSr)), rf = 1.0f - std::exp(-1.0f / (0.012f * kSr)),
+                       as = 1.0f - std::exp(-1.0f / (0.030f * kSr)), rs = 1.0f - std::exp(-1.0f / (0.060f * kSr)),
+                       al = 1.0f - std::exp(-6.2831853f * 700.0f / kSr);
+    const float a1 = 1.0f - std::exp(-6.2831853f * b.x1 / kSr), a2 = 1.0f - std::exp(-6.2831853f * b.x2 / kSr), tb = std::tanh(b.bias);
+    Dsp& d = in.d;
+    for (unsigned i = 0; i < frames; ++i)
+        for (int c = 0; c < ch; ++c) {
+            float x = buf[i * static_cast<unsigned>(ch) + static_cast<unsigned>(c)];
+            in.l1[c] += a1 * (x - in.l1[c]);
+            in.l2[c] += a2 * (x - in.l2[c]);
+            x = in.l1[c] * b.lg + (in.l2[c] - in.l1[c]) * b.mg + (x - in.l2[c]) * b.hg;
+            const float ax = x < 0 ? -x : x;
+            d.ef[c] += (ax - d.ef[c]) * (ax > d.ef[c] ? af : rf);
+            d.es[c] += (ax - d.es[c]) * (ax > d.es[c] ? as : rs);
+            float g = 1.0f + b.k * ((d.ef[c] + 1e-4f) / (d.es[c] + 1e-4f) - 1.0f);
+            g = g < 0.5f ? 0.5f : (g > 2.5f ? 2.5f : g);
+            const float y = x * g;
+            d.lp[c] += al * (y - d.lp[c]);
+            const float wet = (std::tanh(b.drive * (y - d.lp[c]) + b.bias) - tb) * 0.7f;
+            d.wl[c] += 0.45f * (wet - d.wl[c]);
+            float o = (y + b.mix * d.wl[c]) * b.gain;
+            const float ao = o < 0 ? -o : o;
+            if (ao > b.limit) o = (o < 0 ? -1.0f : 1.0f) * (b.limit + (1.0f - b.limit) * std::tanh((ao - b.limit) / (1.0f - b.limit)));
+            buf[i * static_cast<unsigned>(ch) + static_cast<unsigned>(c)] = o;
+        }
+}
 
 struct Group { void* eq = nullptr; void* eq2 = nullptr; void* echo = nullptr; void* dist = nullptr; void* cdsp = nullptr; Dsp* cst = nullptr; unsigned serial = 0; };
 std::mutex g_gmu;
@@ -491,6 +548,59 @@ void apply(void* sys, void* grp, int cls, bool gran) {
     }
 }
 
+float db2lin(float db) { return std::pow(10.0f, db / 20.0f); }
+int synth_tier(int exh) {
+    int t = exh ? g_exh_tier.load() : g_int_tier.load();
+    const int pv = g_preview.load();
+    if (pv >= 1 && pv <= 4) t = pv - 1;
+    if (!g_enabled.load()) t = 0;
+    return t;
+}
+int detour_synth(void* st, float* in, float* out, unsigned length, int inch, int* outch) {
+    const int r = g_orig_synth(st, in, out, length, inch, outch);
+    int ch = outch ? *outch : inch;
+    if (r != 0 || !out || length == 0 || length > 4096 || ch < 1 || ch > 8) return r;
+    const int te = synth_tier(1), ti = synth_tier(0);
+    if (te == 0 && ti == 0) return r;
+    const float ea = g_exh_amount.load(), ia = g_int_amount.load(), rasp = g_rasp.load() * 4.0f > 2.5f ? 2.5f : g_rasp.load() * 4.0f;
+    const Fx &fe = kExhFx[te], &fi = kIntFx[ti];
+    const Dp &de = kExhDp[te], &di = kIntDp[ti];
+    auto clampf = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
+    Blk b;
+    b.k     = clampf(de.k * ea * 0.6f + di.k * ia * 0.4f, 0, 1.5f);
+    b.drive = de.drive > di.drive ? de.drive : di.drive;
+    b.mix   = clampf((de.mix * ea * 0.6f + di.mix * ia * 0.4f) * rasp, 0, 1.2f);
+    b.bias  = de.bias > di.bias ? de.bias : di.bias;
+    b.gain  = db2lin(clampf(de.gain_db * ea * 0.6f + di.gain_db * ia * 0.4f, 0, 6));
+    b.lg    = db2lin(clampf(fe.low * ea * 0.6f + fi.low * ia * 0.4f, 0, 10));
+    b.mg    = db2lin(clampf((fe.mid + fe.band * 0.5f) * ea * 0.6f + (fi.mid + fi.band * 0.5f) * ia * 0.4f, 0, 10));
+    b.hg    = db2lin(clampf(fe.high * ea * 0.6f + fi.high * ia * 0.4f, 0, 10));
+    b.x1    = te ? fe.x1 : fi.x1;
+    b.x2    = te ? fe.x2 : fi.x2;
+    b.limit = 0.95f;
+    Inst* slot = nullptr;
+    const uint64_t now = GetTickCount64();
+    for (Inst& s : g_inst)
+        if (s.key == st) { slot = &s; break; }
+    if (!slot) {   // a new synth: a free slot, else the one not used for the longest time (cars come and go)
+        Inst* pick = &g_inst[0];
+        for (Inst& s : g_inst) {
+            if (!s.key) { pick = &s; break; }
+            if (s.last < pick->last) pick = &s;
+        }
+        memset(pick->d.ef, 0, sizeof pick->d.ef); memset(pick->d.es, 0, sizeof pick->d.es); memset(pick->d.lp, 0, sizeof pick->d.lp);
+        memset(pick->d.wl, 0, sizeof pick->d.wl); memset(pick->l1, 0, sizeof pick->l1); memset(pick->l2, 0, sizeof pick->l2);
+        pick->key = st;
+        slot = pick;
+    }
+    slot->last = now;
+    if (!slot) return r;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) == 0) say("granular engine synth is running through us (%d channel(s), %u frames per block)", ch, length);
+    process_block(*slot, out, length, ch, b);
+    return r;
+}
+
 int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
     const int r = g_orig_play(snd, sys, grp, paused, a5, ch);
     if (r != 0 || !snd || !sys || !grp) return r;
@@ -562,7 +672,8 @@ DWORD WINAPI worker(LPVOID) {
     char* base = static_cast<char*>(g_api->wait_for_code(180000));
     if (!base) { say("the game was not mapped in time: doing nothing"); return 0; }
     g_game = base;
-    g_antilag = GetModuleHandleW(L"AntiLag.dll") != nullptr;
+    g_antilag_mod = GetModuleHandleW(L"AntiLag.dll");
+    g_antilag = g_antilag_mod != nullptr;
     say(g_antilag ? "the Anti-Lag mod is installed: its pops are left as they are" : "the Anti-Lag mod is not installed: the game's pops get the exhaust tone");
     for (const Sig& s : kSigs) {
         unsigned char got[6] = {};
@@ -577,9 +688,11 @@ DWORD WINAPI worker(LPVOID) {
                                        reinterpret_cast<void*>(&detour_play), reinterpret_cast<void**>(&g_orig_play));
     FH3Hook* h4 = g_api->hook_function(g_mod, "FMOD System::playSound (Engine Sound Tiers: the granular engine synth)", base + kPlaySound,
                                        reinterpret_cast<void*>(&detour_play2), reinterpret_cast<void**>(&g_orig_play2));
+    FH3Hook* h5 = g_api->hook_function(g_mod, "PG Engine Synth read (Engine Sound Tiers: granular engines)", base + kSynthRead,
+                                       reinterpret_cast<void*>(&detour_synth), reinterpret_cast<void**>(&g_orig_synth));
     FH3Hook* h3 = g_api->hook_function(g_mod, "HUD controller (Engine Sound Tiers: the driven car's parts)", base + kHud,
                                        reinterpret_cast<void*>(&detour_hud), reinterpret_cast<void**>(&g_orig_hud));
-    if (!h1 || !h2 || !h3 || !h4 || !g_api->enable_hooks(g_mod, nullptr)) {
+    if (!h1 || !h2 || !h3 || !h4 || !h5 || !g_api->enable_hooks(g_mod, nullptr)) {
         say("could not place the hooks (see the lines above): doing nothing");
         g_api->disable_hooks(g_mod, nullptr);
         return 0;
