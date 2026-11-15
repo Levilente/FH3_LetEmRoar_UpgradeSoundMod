@@ -126,6 +126,10 @@ void on_slide(void*, const char* key, float value) {
 
 // ---- the driven car: its levels and its sound bank ----------------------------------------------------------------------
 std::atomic<int> g_exh_tier{0}, g_int_tier{0};
+std::atomic<float> g_load{0.0f};   // 0..1: throttle x revs of the driven car, smoothed (an open pipe is rawest under load)
+std::atomic<float> g_thr{0.0f};
+std::atomic<float> g_rpm_peak{0.0f};
+constexpr size_t kCarIface = 0x71E8, kIfaceToDyn = 0x4B0, kDynThrottle = 0x1BD0, kDynOmega = 0x5F8;   // as the Anti-Lag mod reads them
 std::atomic<int> g_bank_pg{-1}, g_bank_gs{-1};
 std::atomic<long> g_dc[5]{};   // diagnostics for the driven car: plays classified as other / exhaust / engine bay
 std::atomic<uint64_t> g_dnext{0};
@@ -157,6 +161,7 @@ void car_seen(char* car) {
     if (ex == last_ex && in == last_in && !strcmp(name, last_name)) return;
     last_ex = ex; last_in = in;
     memcpy(last_name, name, sizeof name);
+    g_rpm_peak = 0;
     auto tier = [](int32_t v) { if (v < 0) return 0; const int t = v % 1000; return t > 3 ? 3 : t; };
     g_exh_tier = tier(ex);
     g_int_tier = tier(in);
@@ -180,6 +185,28 @@ void car_seen(char* car) {
 
 uint64_t detour_hud(void* c, void* a, void* b, void* d) {
     const uint64_t r = g_orig_hud(c, a, b, d);
+    {   // throttle and revs of the driven car, every frame
+        char* car = nullptr;
+        void* cb  = nullptr;
+        char* iface = nullptr;
+        if (c && rd(static_cast<char*>(c) + 0x120, &car, 8) && rd(static_cast<char*>(c) + 0x128, &cb, 8) && car && cb && rd(car + kCarIface, &iface, 8) && iface) {
+            char* dyn = iface - kIfaceToDyn;
+            float thr = 0, omega = 0;
+            if (rd(dyn + kDynThrottle, &thr, 4) && rd(dyn + kDynOmega, &omega, 4) && thr == thr && omega == omega) {
+                thr = thr < 0 ? 0 : (thr > 1 ? 1 : thr);
+                const float rpm = omega * 9.549296586f;
+                float pk = g_rpm_peak.load();
+                if (rpm > pk && rpm < 20000.0f) { pk = rpm; g_rpm_peak = pk; }
+                const float top = pk > 5500.0f ? pk : 5500.0f;
+                float rn = (rpm - 1200.0f) / (top - 1200.0f);
+                rn = rn < 0 ? 0 : (rn > 1 ? 1 : rn);
+                const float ts = g_thr.load() + (thr - g_thr.load()) * 0.35f;
+                g_thr = ts;
+                const float target = ts * (0.4f + 0.6f * rn);
+                g_load = g_load.load() + (target - g_load.load()) * 0.25f;
+            }
+        }
+    }
     static std::atomic<uint64_t> next{0};
     const uint64_t now = GetTickCount64();
     if (now < next.load()) return r;
@@ -188,7 +215,7 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
         const uint64_t dn = g_dnext.load();
         if (dn && now > dn) {
             g_dnext = now + 60000;
-            say("sounds of the driven car so far: exhaust %ld, engine bay %ld, other %ld (tracks with effect: %ld)", g_dc[1].load(), g_dc[2].load(), g_dc[0].load(), g_n_groups.load());
+            say("sounds of the driven car so far: exhaust %ld, engine bay %ld, other %ld (tracks with effect: %ld); throttle %.2f, load %.2f, rev peak %.0f", g_dc[1].load(), g_dc[2].load(), g_dc[0].load(), g_n_groups.load(), g_thr.load(), g_load.load(), g_rpm_peak.load());
         }
     }
     char* car = nullptr;
@@ -313,7 +340,7 @@ const Fx kIntFx[4] = {
 // 2. Harmonic rasp: the part above ~700 Hz goes through an asymmetric soft clipper (even + odd harmonics) and is mixed back low: a
 //    ragged, open edge instead of the hard "distorted" sound of a clipper over the whole signal.
 // 3. A little make-up gain, and a soft limiter so nothing clips.
-struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}; std::atomic<bool> dead{false}; };
+struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}, floor{0.4f}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}; std::atomic<bool> dead{false}; };
 thread_local Dsp* t_new_dsp = nullptr;
 constexpr float kSr = 48000.0f;
 
@@ -337,7 +364,8 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
     static const float af = 1.0f - std::exp(-1.0f / (0.0007f * kSr)), rf = 1.0f - std::exp(-1.0f / (0.012f * kSr)),
                        as = 1.0f - std::exp(-1.0f / (0.030f * kSr)), rs = 1.0f - std::exp(-1.0f / (0.060f * kSr)),
                        al = 1.0f - std::exp(-6.2831853f * 700.0f / kSr);
-    const float k = d->k.load(), drive = d->drive.load(), mix = d->mix.load(), bias = d->bias.load(), gain = d->gain.load();
+    const float fl = d->floor.load(), dyn = fl + (1.0f - fl) * g_load.load();   // rawer under load, cleaner on a lift
+    const float k = d->k.load() * dyn, drive = d->drive.load(), mix = d->mix.load() * dyn, bias = d->bias.load(), gain = 1.0f + (d->gain.load() - 1.0f) * dyn;
     const float tb = std::tanh(bias);
     for (unsigned i = 0; i < length; ++i)
         for (int c = 0; c < inch; ++c) {
@@ -537,6 +565,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
         else if (!st && g_n_err.fetch_add(1) < 5) say("FMOD would not make our own effect (the grit falls back to FMOD's distortion)");
     }
     if (g.cst && !g.cst->dead.load()) {
+        g.cst->floor = cls == 2 ? 0.5f : 0.35f;
         g.cst->k = dp.k; g.cst->drive = dp.drive; g.cst->mix = dp.mix; g.cst->bias = dp.bias;
         g.cst->gain = std::pow(10.0f, dp.gain_db / 20.0f);
     } else if (dp_on && !g.cdsp && fx.dist > 0) {   // fallback: FMOD's own distortion, lightly
@@ -578,6 +607,11 @@ int detour_synth(void* st, float* in, float* out, unsigned length, int inch, int
     b.x1    = te ? fe.x1 : fi.x1;
     b.x2    = te ? fe.x2 : fi.x2;
     b.limit = 0.95f;
+    {   // rawer under load, cleaner on a lift
+        const float dyn = 0.35f + 0.65f * g_load.load();
+        b.k = b.k * dyn; b.mix = b.mix * dyn; b.gain = 1.0f + (b.gain - 1.0f) * dyn;
+        b.hg = 1.0f + (b.hg - 1.0f) * (0.5f + 0.5f * dyn);
+    }
     Inst* slot = nullptr;
     const uint64_t now = GetTickCount64();
     for (Inst& s : g_inst)
@@ -626,7 +660,7 @@ int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch)
         static std::atomic<uint64_t> last{0};
         auto rnd = [&] { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return static_cast<float>(rng & 0xFFFF) / 65535.0f; };
         const uint64_t now = GetTickCount64();
-        const float p = kP[tier] * g_pops.load() * g_exh_amount.load();
+        const float p = kP[tier] * g_pops.load() * g_exh_amount.load() * (0.7f + 0.6f * (1.0f - g_thr.load()));   // most on a lift
         if (p > 0 && now - last.load() > 45 && rnd() < p) {
             last.store(now);
             void* ch2 = nullptr;
