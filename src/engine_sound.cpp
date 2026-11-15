@@ -132,6 +132,7 @@ std::atomic<float> g_thr{0.0f};
 std::atomic<float> g_rpm_peak{0.0f};
 constexpr size_t kCarIface = 0x71E8, kIfaceToDyn = 0x4B0, kDynThrottle = 0x1BD0, kDynOmega = 0x5F8;   // as the Anti-Lag mod reads them
 std::atomic<int> g_bank_pg{-1}, g_bank_gs{-1};
+std::atomic<uint64_t> g_hud_tick{0}, g_busy_until{0};   // the HUD ticks every frame in the world, never on a loading screen
 std::atomic<long> g_dc[5]{};   // diagnostics for the driven car: plays classified as other / exhaust / engine bay
 std::atomic<uint64_t> g_dnext{0};
 std::atomic<long> g_n_groups{0}, g_n_err{0};   // rows of kBankTier of the driven car's banks, -1 = not known
@@ -186,6 +187,7 @@ void car_seen(char* car) {
 
 uint64_t detour_hud(void* c, void* a, void* b, void* d) {
     const uint64_t r = g_orig_hud(c, a, b, d);
+    g_hud_tick = GetTickCount64();
     {   // throttle and revs of the driven car, every frame
         char* car = nullptr;
         void* cb  = nullptr;
@@ -678,6 +680,14 @@ int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch)
         if (g_antilag) return r;   // the Anti-Lag mod owns the pop sound itself: its tone stays as it is
         cls = 1;                   // without Anti-Lag the pop gets the exhaust's tone like the rest of the exhaust
     }
+    {   // no changes to the sound graph while the game loads (a car change): no HUD frames lately, or a burst of new sounds
+        const uint64_t now = GetTickCount64();
+        if (now - g_hud_tick.load() > 1500 || now < g_busy_until.load()) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 3) say("the game is loading: the sound graph is left alone for now");
+            return r;
+        }
+    }
     // FMOD is called below: never wait for our own lock while the game may hold FMOD's
     std::unique_lock gl{g_gmu, std::try_to_lock};
     if (gl.owns_lock()) {
@@ -746,6 +756,7 @@ DWORD WINAPI worker(LPVOID) {
     for (;;) {
         Sleep(4000);
         const long c = g_n_create.load(), p = g_n_play.load(), a = g_n_apply.load();
+        if (c - c0 > 150) g_busy_until = GetTickCount64() + 6000;
         if (c - c0 > 300 || a - a0 > 300) {
             say("busy: %ld sounds created, %ld played, %ld effect set-ups in the last 4 s (slowest set-up so far %.1f ms)", c - c0, p - p0, a - a0, g_apply_max_us.load() / 1000.0);
             g_apply_max_us = 0;
