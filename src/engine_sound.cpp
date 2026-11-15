@@ -195,7 +195,7 @@ std::atomic<int> g_user_logged{0};
 int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex, void** out) {
     const int r = g_orig_create(sys, name, mode, ex, out);
     if (r != 0 || !out || !ex || !*out) return r;
-    if (mode & 0x80) {   // FMOD_OPENUSER
+    if (mode & 0x200) {   // FMOD_OPENUSER
         int cb0 = 0, nch = 0, freq = 0, fmt = 0;
         uint64_t pcm = 0;
         if (rd(ex, &cb0, 4) && cb0 >= 0x40 && rd(ex + 0x38, &pcm, 8) && pcm && rd(ex + 0xC, &nch, 4) && rd(ex + 0x10, &freq, 4) && rd(ex + 0x14, &fmt, 4)) {
@@ -248,16 +248,16 @@ int classify(void* snd, int* row) {
 struct Fx { float low, mid, high, dist, x1, x2; };   // gains in dB, distortion, crossovers in Hz
 // Exhaust: stock; sport rear muffler; sport rear + middle muffler; open straight-through system.
 const Fx kExhFx[4] = {
-    {0, 0, 0, 0, 250, 2500},          // stock: untouched
-    {1.0f, 2.5f, 2.0f, 0, 250, 2500},     // street: sport rear muffler - less muffled, a bit louder, fuller mids
-    {4.0f, 3.0f, 1.0f, 0.06f, 200, 2200}, // sport: rear + middle muffler - deeper, barking, still round on top
-    {6.5f, 3.5f, 5.0f, 0.30f, 160, 3200}};// race: open system - deep and meaty body, raw rasp on top
+    {0, 0, 0, 0, 250, 2500},               // stock: untouched
+    {0.5f, 2.5f, 2.5f, 0.03f, 250, 2500},  // street: sport rear muffler - less muffled, a bit louder, a touch of edge
+    {1.5f, 3.0f, 3.5f, 0.14f, 220, 2200},  // sport: rear + middle muffler - barking, rasp comes in
+    {3.0f, 3.5f, 7.0f, 0.42f, 200, 3000}}; // race: open system - raw, ragged, open; body kept in check
 // Intake: stock; sport panel filter; cone filter; ITB / mesh.
 const Fx kIntFx[4] = {
     {0, 0, 0, 0, 250, 2500},
-    {0, 1.5f, 2.5f, 0, 300, 3000},        // street: induction hiss starts to show
-    {1.0f, 3.5f, 4.0f, 0, 300, 2600},     // sport: cone filter - clear, loud induction howl
-    {3.0f, 4.5f, 6.5f, 0.18f, 220, 2800}};// race: ITB - big loud induction roar, a little rasp
+    {0, 1.5f, 3.0f, 0.02f, 300, 3000},     // street: induction hiss starts to show
+    {0.5f, 3.5f, 4.5f, 0.08f, 300, 2600},  // sport: cone filter - clear, loud induction howl
+    {1.5f, 4.5f, 7.0f, 0.25f, 250, 2800}}; // race: ITB - big induction roar with rasp
 
 struct Group { void* eq = nullptr; void* dist = nullptr; unsigned serial = 0; };
 std::mutex g_gmu;
