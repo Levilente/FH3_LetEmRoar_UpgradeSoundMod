@@ -209,8 +209,8 @@ int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex,
             }
             if (g_user_logged.fetch_add(1) < 12)
                 say("PCM-callback sound made: callback game+0x%llX, %d channel(s), %d Hz, format %d", static_cast<unsigned long long>(pcm - reinterpret_cast<uint64_t>(g_game)), nch, freq, fmt);
+            return r;
         }
-        return r;
     }
     int cb = 0, cnt = 0;
     int* incl = nullptr;
