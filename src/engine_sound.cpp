@@ -16,6 +16,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <new>
 #include <cstdint>
@@ -233,10 +234,12 @@ std::unordered_map<void*, Made> g_made;
 
 std::unordered_set<void*> g_pop;          // sounds the Anti-Lag mod made (its pop samples), guarded by g_mu
 HMODULE g_antilag_mod = nullptr;
+std::atomic<long> g_n_create{0}, g_n_play{0}, g_n_apply{0}, g_apply_max_us{0};   // activity, for the watchdog line
 std::unordered_map<void*, int> g_user;   // sounds that are fed by a PCM callback (the granular engine synth), guarded by g_mu
 std::atomic<int> g_user_logged{0};
 
 int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex, void** out) {
+    g_n_create.fetch_add(1);
     const int r = g_orig_create(sys, name, mode, ex, out);
     // The Anti-Lag mod's pop samples are raw PCM held in memory (OPENMEMORY | OPENRAW); the game's bank samples never are. (The caller's
     // module can not be used: with chained hooks every call may appear to come from the Anti-Lag mod.)
@@ -635,6 +638,7 @@ int detour_synth(void* st, float* in, float* out, unsigned length, int inch, int
 
 int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
     const int r = g_orig_play(snd, sys, grp, paused, a5, ch);
+    g_n_play.fetch_add(1);
     if (r != 0 || !snd || !sys || !grp) return r;
     int row = -1, cls = 0;
     {
@@ -676,7 +680,14 @@ int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch)
     }
     // FMOD is called below: never wait for our own lock while the game may hold FMOD's
     std::unique_lock gl{g_gmu, std::try_to_lock};
-    if (gl.owns_lock()) apply(sys, grp, cls, gran);
+    if (gl.owns_lock()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        apply(sys, grp, cls, gran);
+        const long us = static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+        g_n_apply.fetch_add(1);
+        long m = g_apply_max_us.load();
+        while (us > m && !g_apply_max_us.compare_exchange_weak(m, us)) {}
+    }
     return r;
 }
 
@@ -730,6 +741,17 @@ DWORD WINAPI worker(LPVOID) {
         return 0;
     }
     say("ready: %d car sound banks known; exhaust and intake sound now follow the car's parts", kBanks);
+    // watchdog: while the game is busy loading (no HUD line then) say what the sound system is doing, so a slow load can be traced
+    long c0 = 0, p0 = 0, a0 = 0;
+    for (;;) {
+        Sleep(4000);
+        const long c = g_n_create.load(), p = g_n_play.load(), a = g_n_apply.load();
+        if (c - c0 > 300 || a - a0 > 300) {
+            say("busy: %ld sounds created, %ld played, %ld effect set-ups in the last 4 s (slowest set-up so far %.1f ms)", c - c0, p - p0, a - a0, g_apply_max_us.load() / 1000.0);
+            g_apply_max_us = 0;
+        }
+        c0 = c; p0 = p; a0 = a;
+    }
     return 0;
 }
 
