@@ -240,7 +240,7 @@ int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex,
 }
 
 // 0 = neither, 1 = exhaust, 2 = engine bay, 4 = the game's own backfire pop; *row = the bank
-// Pops are left completely alone while the Anti-Lag mod is installed: it owns them (it plays its own sample in their place).
+// Pops: the Anti-Lag mod owns their sound while it is installed (its own sample plays in their place); we only add extra ones then.
 bool g_antilag = false;
 int classify(void* snd, int* row) {
     auto it = g_made.find(snd);
@@ -256,7 +256,7 @@ int classify(void* snd, int* row) {
     for (const BankBf& bf : kBankBf) {
         if (bf.off != b.off || bf.len != b.len) continue;
         for (int j = 0; j < bf.cnt; ++j)
-            if (bf.idx[j] == m.idx) return g_antilag ? 0 : 4;
+            if (bf.idx[j] == m.idx) return 4;
     }
     if (b.exh[m.idx >> 6] >> (m.idx & 63) & 1) return 1;
     if (b.eng[m.idx >> 6] >> (m.idx & 63) & 1) return 2;
@@ -281,8 +281,8 @@ struct Fx {
 const Fx kExhFx[4] = {
     {0, 0, 0, 250, 2500, 0, 700, 1800, 12, -80, 0, 0},
     {1.0f, 1.5f, 1.5f, 250, 2500, 1.5f, 700, 1800, 12, -80, 0, 0},              // a little louder and less muffled
-    {1.5f, 2.5f, 2.5f, 230, 2500, 3.0f, 600, 2000, 13, -19, 22, 0.10f},        // bark: upper mids open up, the pipe starts to ring
-    {2.5f, 3.0f, 4.5f, 210, 2600, 5.0f, 500, 2200, 11, -13, 32, 0.40f}};       // open pipe: loud, raspy band, hollow ring, bright
+    {2.5f, 2.5f, 2.5f, 230, 2500, 3.0f, 600, 2000, 13, -19, 22, 0.10f},        // bark: upper mids open up, the pipe starts to ring
+    {4.5f, 3.5f, 4.5f, 210, 2600, 5.5f, 450, 2200, 11, -13, 32, 0.40f}};       // open pipe: loud, raspy band, hollow ring, bright
 // Intake (the engine-bay layer): stock; sport panel filter; cone filter; ITB / mesh.
 const Fx kIntFx[4] = {
     {0, 0, 0, 250, 2500, 0, 250, 700, 10, -80, 0, 0},
@@ -297,7 +297,7 @@ const Fx kIntFx[4] = {
 // 2. Harmonic rasp: the part above ~700 Hz goes through an asymmetric soft clipper (even + odd harmonics) and is mixed back low: a
 //    ragged, open edge instead of the hard "distorted" sound of a clipper over the whole signal.
 // 3. A little make-up gain, and a soft limiter so nothing clips.
-struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}; std::atomic<bool> dead{false}; };
+struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}; std::atomic<bool> dead{false}; };
 thread_local Dsp* t_new_dsp = nullptr;
 constexpr float kSr = 48000.0f;
 
@@ -334,7 +334,9 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
             const float y = x * g;
             d->lp[c] += al * (y - d->lp[c]);
             const float hp = y - d->lp[c];
-            float o = (y + mix * (std::tanh(drive * hp + bias) - tb) * 0.7f) * gain;
+            const float wet = (std::tanh(drive * hp + bias) - tb) * 0.7f;
+            d->wl[c] += 0.45f * (wet - d->wl[c]);   // the added rasp is smoothed above ~7 kHz: ragged, not fizzy
+            float o = (y + mix * d->wl[c]) * gain;
             const float ao = o < 0 ? -o : o;
             if (ao > 0.8f) o = (o < 0 ? -1.0f : 1.0f) * (0.8f + 0.2f * std::tanh((ao - 0.8f) / 0.2f));
             out[i * static_cast<unsigned>(inch) + static_cast<unsigned>(c)] = o;
@@ -363,7 +365,7 @@ Dsp* make_dsp(void* sys, void** dsp_out) {
     return t_new_dsp;
 }
 struct Dp { float k, drive, mix, bias, gain_db; };
-const Dp kExhDp[4] = {{0, 1, 0, 0, 0}, {0.12f, 1.5f, 0.10f, 0.10f, 0}, {0.40f, 2.5f, 0.28f, 0.20f, 1.0f}, {0.80f, 3.5f, 0.55f, 0.30f, 2.0f}};
+const Dp kExhDp[4] = {{0, 1, 0, 0, 0}, {0.12f, 1.5f, 0.10f, 0.10f, 0}, {0.40f, 2.5f, 0.28f, 0.20f, 1.0f}, {0.80f, 3.0f, 0.55f, 0.30f, 1.5f}};
 const Dp kIntDp[4] = {{0, 1, 0, 0, 0}, {0.05f, 1.5f, 0.05f, 0.10f, 0}, {0.20f, 2.0f, 0.15f, 0.15f, 0.5f}, {0.45f, 3.0f, 0.35f, 0.25f, 1.0f}};
 
 struct Group { void* eq = nullptr; void* eq2 = nullptr; void* echo = nullptr; void* dist = nullptr; void* cdsp = nullptr; Dsp* cst = nullptr; unsigned serial = 0; };
@@ -372,7 +374,7 @@ std::unordered_map<void*, Group> g_groups;   // track channel groups that carry 
 
 template <class F> F fn(uintptr_t rva) { return reinterpret_cast<F>(g_game + rva); }
 
-void apply(void* sys, void* grp, int cls) {
+void apply(void* sys, void* grp, int cls, bool gran) {
     const int pv = g_preview.load();
     auto pick = [&](int exh) {
         int t = exh ? g_exh_tier.load() : g_int_tier.load();
@@ -411,7 +413,7 @@ void apply(void* sys, void* grp, int cls) {
         } else dp = sdp((cls == 1 ? kExhDp : kIntDp)[tier], cls == 1 ? g_exh_amount.load() : g_int_amount.load());
         dp.k = clampf(dp.k, 0, 1.5f); dp.mix = clampf(dp.mix, 0, 1.2f); dp.gain_db = clampf(dp.gain_db, 0, 6);
     }
-    const bool dp_on = dp.k > 0 || dp.mix > 0 || dp.gain_db > 0;
+    const bool dp_on = !gran && (dp.k > 0 || dp.mix > 0 || dp.gain_db > 0);   // granular cars: the EQ only (their loading stuck with our own effect)
     fx.low = clampf(fx.low, 0, 10); fx.mid = clampf(fx.mid, 0, 10); fx.high = clampf(fx.high, 0, 10); fx.band = clampf(fx.band, 0, 10);
     fx.dist = clampf(fx.dist, 0, 0.6f); fx.echo_wet = clampf(fx.echo_wet, -80, -6);
     const bool nothing = !dp_on && fx.low == 0 && fx.mid == 0 && fx.high == 0 && fx.band == 0 && fx.echo_wet <= -80;
@@ -503,7 +505,8 @@ int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch)
         const int pg = g_bank_pg.load(), gs = g_bank_gs.load();
         if ((pg >= 0 || gs >= 0) && row != pg && row != gs) return r;   // another car's sound (when the driven car's bank is known)
     }
-    if (cls == 4) {   // one of the game's backfire pops: with a better exhaust it is played once more (a "double crack", a little off in pitch)
+    const bool gran = g_bank_gs.load() >= 0 || (row >= 0 && !strncmp(kBankTier[row].name, "GS_", 3));
+    if (cls == 4 && !gran) {   // one of the game's backfire pops: with a better exhaust it is played once more (a "double crack", a little off in pitch)
         int tier = g_exh_tier.load();
         const int pv = g_preview.load();
         if (pv >= 1 && pv <= 4) tier = pv - 1;
@@ -524,12 +527,14 @@ int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch)
                 if (logged.fetch_add(1) < 3) say("extra pop played (level %d)", tier);
             }
         }
+    }
+    if (cls == 4) {
         if (g_antilag) return r;   // the Anti-Lag mod owns the pop sound itself: its tone stays as it is
         cls = 1;                   // without Anti-Lag the pop gets the exhaust's tone like the rest of the exhaust
     }
     // FMOD is called below: never wait for our own lock while the game may hold FMOD's
     std::unique_lock gl{g_gmu, std::try_to_lock};
-    if (gl.owns_lock()) apply(sys, grp, cls);
+    if (gl.owns_lock()) apply(sys, grp, cls, gran);
     return r;
 }
 
@@ -548,7 +553,7 @@ int detour_play2(void* sys, void* snd, void* grp, bool paused, void** ch) {
     if (!user) return r;
     if (g_play2_logged.fetch_add(1) < 6) say("granular synth sound played into group %p", grp);
     std::unique_lock gl{g_gmu, std::try_to_lock};
-    if (gl.owns_lock()) apply(sys, grp, 3);
+    if (gl.owns_lock()) apply(sys, grp, 3, true);
     return r;
 }
 
