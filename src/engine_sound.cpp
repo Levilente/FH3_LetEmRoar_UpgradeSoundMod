@@ -87,6 +87,7 @@ std::atomic<int> g_enabled{1};
 std::atomic<int> g_preview{0};          // 0 = the car's own parts, 1..4 = force Stock / Street / Sport / Race on both
 std::atomic<float> g_exh_amount{1.0f};  // 0 .. 2
 std::atomic<float> g_int_amount{1.0f};
+std::atomic<float> g_rasp{0.25f};        // 0 .. 2, scales the distortion (the rasp) of every level
 std::atomic<int> g_all_cars{0};         // also other cars that use the same sound bank (they do anyway); 1 = every car on the road
 std::atomic<unsigned> g_cfg_serial{1};  // bumped when anything that changes the effect changes
 
@@ -105,6 +106,7 @@ void on_change(void*, const char* key, int value) {
 }
 void on_slide(void*, const char* key, float value) {
     if (!strcmp(key, "ExhaustAmount")) { g_exh_amount = value / 100.0f; ini_set(L"ExhaustAmount", static_cast<int>(value + 0.5f)); }
+    else if (!strcmp(key, "Rasp")) { g_rasp = value / 100.0f; ini_set(L"Rasp", static_cast<int>(value + 0.5f)); }
     else if (!strcmp(key, "IntakeAmount")) { g_int_amount = value / 100.0f; ini_set(L"IntakeAmount", static_cast<int>(value + 0.5f)); }
     g_cfg_serial.fetch_add(1);
 }
@@ -249,15 +251,15 @@ struct Fx { float low, mid, high, dist, x1, x2; };   // gains in dB, distortion,
 // Exhaust: stock; sport rear muffler; sport rear + middle muffler; open straight-through system.
 const Fx kExhFx[4] = {
     {0, 0, 0, 0, 250, 2500},               // stock: untouched
-    {0.5f, 2.5f, 2.5f, 0.03f, 250, 2500},  // street: sport rear muffler - less muffled, a bit louder, a touch of edge
-    {1.5f, 3.0f, 3.5f, 0.14f, 220, 2200},  // sport: rear + middle muffler - barking, rasp comes in
-    {3.0f, 3.5f, 7.0f, 0.42f, 200, 3000}}; // race: open system - raw, ragged, open; body kept in check
+    {0.5f, 3.0f, 3.0f, 0.03f, 250, 2200},  // street: sport rear muffler - less muffled, a bit louder, a touch of edge
+    {1.5f, 3.5f, 4.5f, 0.14f, 220, 2000},  // sport: rear + middle muffler - barking, rasp comes in
+    {3.0f, 4.5f, 7.5f, 0.42f, 200, 1800}}; // race: open system - raw, ragged, open; body kept in check
 // Intake: stock; sport panel filter; cone filter; ITB / mesh.
 const Fx kIntFx[4] = {
     {0, 0, 0, 0, 250, 2500},
     {0, 1.5f, 3.0f, 0.02f, 300, 3000},     // street: induction hiss starts to show
     {0.5f, 3.5f, 4.5f, 0.08f, 300, 2600},  // sport: cone filter - clear, loud induction howl
-    {1.5f, 4.5f, 7.0f, 0.25f, 250, 2800}}; // race: ITB - big induction roar with rasp
+    {1.5f, 5.0f, 7.5f, 0.25f, 250, 2000}}; // race: ITB - big induction roar with rasp
 
 struct Group { void* eq = nullptr; void* dist = nullptr; unsigned serial = 0; };
 std::mutex g_gmu;
@@ -273,7 +275,7 @@ void apply(void* sys, void* grp, int cls) {
         if (!g_enabled.load()) t = 0;
         return t;
     };
-    auto scaled = [&](const Fx& f, float a) { Fx r = f; r.low *= a; r.mid *= a; r.high *= a; r.dist *= a; return r; };
+    auto scaled = [&](const Fx& f, float a) { Fx r = f; r.low *= a; r.mid *= a; r.high *= a; r.dist *= a * g_rasp.load(); return r; };
     int tier;
     Fx fx;
     if (cls == 3) {   // a granular engine's synthesised sound: exhaust and intake mixed in one track -> blend both effects
@@ -424,6 +426,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_all_cars   = ini_int(L"AllCars", 0);
     g_exh_amount = static_cast<float>(ini_int(L"ExhaustAmount", 100)) / 100.0f;
     g_int_amount = static_cast<float>(ini_int(L"IntakeAmount", 100)) / 100.0f;
+    g_rasp       = static_cast<float>(ini_int(L"Rasp", 25)) / 100.0f;
 
     FH3Setting s{};
     s.size = sizeof s;
@@ -454,6 +457,13 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     i.description = "How strongly the intake level changes the sound. 100 is the mod's own setting, 0 is none, 200 is double.";
     i.kind = FH3_SETTING_SLIDER; i.min = 0; i.max = 200; i.step = 10; i.slider_value = g_int_amount.load() * 100.0f; i.on_slide = on_slide;
     api->add_setting(g_mod, &i);
+
+    FH3Setting rs{};
+    rs.size = sizeof rs;
+    rs.key = "Rasp"; rs.label = "Rasp / grit (%)";
+    rs.description = "How much grit the higher levels add on top of the open, bright tone. 0 is none (clean), 100 is the mod's full grit, 200 is double. Too much sounds distorted.";
+    rs.kind = FH3_SETTING_SLIDER; rs.min = 0; rs.max = 200; rs.step = 5; rs.slider_value = g_rasp.load() * 100.0f; rs.on_slide = on_slide;
+    api->add_setting(g_mod, &rs);
 
     FH3Setting a{};
     a.size = sizeof a;
