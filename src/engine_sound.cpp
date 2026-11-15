@@ -568,7 +568,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
         else if (!st && g_n_err.fetch_add(1) < 5) say("FMOD would not make our own effect (the grit falls back to FMOD's distortion)");
     }
     if (g.cst && !g.cst->dead.load()) {
-        g.cst->floor = cls == 2 ? 0.5f : 0.35f;
+        g.cst->floor = cls == 2 ? 0.8f : 0.7f;
         g.cst->k = dp.k; g.cst->drive = dp.drive; g.cst->mix = dp.mix; g.cst->bias = dp.bias;
         g.cst->gain = std::pow(10.0f, dp.gain_db / 20.0f);
     } else if (dp_on && !g.cdsp && fx.dist > 0) {   // fallback: FMOD's own distortion, lightly
@@ -611,7 +611,7 @@ int detour_synth(void* st, float* in, float* out, unsigned length, int inch, int
     b.x2    = te ? fe.x2 : fi.x2;
     b.limit = 0.95f;
     {   // rawer under load, cleaner on a lift
-        const float dyn = 0.35f + 0.65f * g_load.load();
+        const float dyn = 0.7f + 0.3f * g_load.load();
         b.k = b.k * dyn; b.mix = b.mix * dyn; b.gain = 1.0f + (b.gain - 1.0f) * dyn;
         b.hg = 1.0f + (b.hg - 1.0f) * (0.5f + 0.5f * dyn);
     }
