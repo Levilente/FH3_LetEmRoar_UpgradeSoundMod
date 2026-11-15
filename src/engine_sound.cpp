@@ -16,6 +16,8 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cmath>
+#include <new>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +30,8 @@ struct BankTier { uint32_t off, len; uint64_t exh[8], eng[8]; const char* name; 
 struct EngineMap { const char* media; const char* engine; const char* granular; };
 #include "bank_tiers.inc"
 #include "engine_map.inc"
+struct BankBf { uint32_t off, len; uint8_t cnt; uint16_t idx[16]; };
+#include "bank_backfires.inc"   // the game's backfire samples per bank (the same table the Anti-Lag mod uses)
 constexpr int kBanks = sizeof kBankTier / sizeof kBankTier[0];
 
 const FH3ModApi* g_api = nullptr;
@@ -39,6 +43,8 @@ HANDLE g_thread        = nullptr;
 constexpr uintptr_t kCreateSound = 0x27BE3F0;   // FMOD::System::createSound(sys, name, mode, exinfo, sound**)
 constexpr uintptr_t kStudioPlay  = 0x29823B0;   // Studio's sound-instrument player (snd, sys, group, paused, a5, channel**)
 constexpr uintptr_t kPlaySound   = 0x27BFA40;   // FMOD::System::playSound(sys, sound, group, paused, channel**)
+constexpr uintptr_t kSetVolume = 0x27C3450, kSetPitch = 0x27C3160;   // ChannelControl::setVolume / setPitch (as the Anti-Lag mod uses them)
+constexpr uintptr_t kCreateDspDesc = 0x27BDF70; // FMOD::System::createDSP(sys, const FMOD_DSP_DESCRIPTION*, dsp**)
 constexpr uintptr_t kCreateDsp   = 0x27BE190;   // FMOD::System::createDSPByType(sys, type, dsp**)
 constexpr uintptr_t kAddDsp      = 0x27C1910;   // FMOD::ChannelControl::addDSP(cc, index, dsp)
 constexpr uintptr_t kGetDsp      = 0x27C1C30;   // FMOD::ChannelControl::getDSP(cc, index, dsp**)
@@ -51,7 +57,7 @@ constexpr int kDspEcho = 6, kDspDistortion = 9, kDspThreeEq = 28;   // FMOD_DSP_
 struct Sig { uintptr_t rva; unsigned char b[6]; };
 const Sig kSigs[] = {
     {kCreateSound, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kStudioPlay, {0x48, 0x89, 0x5c, 0x24, 0x10, 0x48}},
-    {kPlaySound, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kCreateDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},   {kAddDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},
+    {kPlaySound, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kCreateDspDesc, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kCreateDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},   {kAddDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},
     {kGetDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},      {kSetFloat, {0x40, 0x53, 0x55, 0x56, 0x48, 0x81}},
     {kHud, {0x40, 0x57, 0x48, 0x83, 0xec, 0x20}},
 };
@@ -62,6 +68,7 @@ typedef int (*CreateDspFn)(void*, int, void**);
 typedef int (*AddDspFn)(void*, int, void*);
 typedef int (*GetDspFn)(void*, int, void**);
 typedef int (*SetFloatFn)(void*, int, float);
+typedef int (*SetCtlFloatFn)(void*, float);
 typedef uint64_t (*HudFn)(void*, void*, void*, void*);
 CreateSoundFn g_orig_create = nullptr;
 StudioPlayFn g_orig_play    = nullptr;
@@ -88,6 +95,7 @@ std::atomic<int> g_preview{0};          // 0 = the car's own parts, 1..4 = force
 std::atomic<float> g_exh_amount{1.0f};  // 0 .. 2
 std::atomic<float> g_int_amount{1.0f};
 std::atomic<float> g_rasp{0.25f};
+std::atomic<float> g_pops{1.0f};         // 0 .. 2, extra backfire pops
 std::atomic<int> g_pipe{1};             // pipe resonance (short echo) on the Sport / Race exhaust        // 0 .. 2, scales the distortion (the rasp) of every level
 std::atomic<int> g_all_cars{0};         // also other cars that use the same sound bank (they do anyway); 1 = every car on the road
 std::atomic<unsigned> g_cfg_serial{1};  // bumped when anything that changes the effect changes
@@ -108,6 +116,7 @@ void on_change(void*, const char* key, int value) {
 }
 void on_slide(void*, const char* key, float value) {
     if (!strcmp(key, "ExhaustAmount")) { g_exh_amount = value / 100.0f; ini_set(L"ExhaustAmount", static_cast<int>(value + 0.5f)); }
+    else if (!strcmp(key, "Pops")) { g_pops = value / 100.0f; ini_set(L"Pops", static_cast<int>(value + 0.5f)); }
     else if (!strcmp(key, "Rasp")) { g_rasp = value / 100.0f; ini_set(L"Rasp", static_cast<int>(value + 0.5f)); }
     else if (!strcmp(key, "IntakeAmount")) { g_int_amount = value / 100.0f; ini_set(L"IntakeAmount", static_cast<int>(value + 0.5f)); }
     g_cfg_serial.fetch_add(1);
@@ -116,7 +125,7 @@ void on_slide(void*, const char* key, float value) {
 // ---- the driven car: its levels and its sound bank ----------------------------------------------------------------------
 std::atomic<int> g_exh_tier{0}, g_int_tier{0};
 std::atomic<int> g_bank_pg{-1}, g_bank_gs{-1};
-std::atomic<long> g_dc[3]{};   // diagnostics for the driven car: plays classified as other / exhaust / engine bay
+std::atomic<long> g_dc[5]{};   // diagnostics for the driven car: plays classified as other / exhaust / engine bay
 std::atomic<uint64_t> g_dnext{0};
 std::atomic<long> g_n_groups{0}, g_n_err{0};   // rows of kBankTier of the driven car's banks, -1 = not known
 
@@ -230,7 +239,9 @@ int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex,
     return r;
 }
 
-// 0 = neither, 1 = exhaust, 2 = engine bay; *row = the bank
+// 0 = neither, 1 = exhaust, 2 = engine bay, 4 = the game's own backfire pop; *row = the bank
+// Pops are left completely alone while the Anti-Lag mod is installed: it owns them (it plays its own sample in their place).
+bool g_antilag = false;
 int classify(void* snd, int* row) {
     auto it = g_made.find(snd);
     if (it == g_made.end()) {
@@ -242,6 +253,11 @@ int classify(void* snd, int* row) {
     if (m.idx >= 512) return 0;
     *row = m.row;
     const BankTier& b = kBankTier[m.row];
+    for (const BankBf& bf : kBankBf) {
+        if (bf.off != b.off || bf.len != b.len) continue;
+        for (int j = 0; j < bf.cnt; ++j)
+            if (bf.idx[j] == m.idx) return g_antilag ? 0 : 4;
+    }
     if (b.exh[m.idx >> 6] >> (m.idx & 63) & 1) return 1;
     if (b.eng[m.idx >> 6] >> (m.idx & 63) & 1) return 2;
     return 0;
@@ -274,7 +290,83 @@ const Fx kIntFx[4] = {
     {0.5f, 1.0f, 1.5f, 250, 3000, 4.0f, 250, 900, 10, -80, 0, 0},              // cone filter: clear induction growl
     {1.0f, 2.0f, 3.0f, 250, 2800, 6.0f, 300, 1200, 10, -80, 0, 0.20f}};        // ITB: loud bark, wider and higher
 
-struct Group { void* eq = nullptr; void* eq2 = nullptr; void* echo = nullptr; void* dist = nullptr; unsigned serial = 0; };
+
+// ---- our own FMOD DSP: what an EQ cannot do ------------------------------------------------------------------------------------
+// 1. Pulse emphasis: a muffler smooths the exhaust's pulse train; an open pipe doesn't. A fast and a slow envelope follower tell where a
+//    pulse is; the gain is raised on the pulse and eased between pulses (a downward-biased transient shaper), so single cylinders speak.
+// 2. Harmonic rasp: the part above ~700 Hz goes through an asymmetric soft clipper (even + odd harmonics) and is mixed back low: a
+//    ragged, open edge instead of the hard "distorted" sound of a clipper over the whole signal.
+// 3. A little make-up gain, and a soft limiter so nothing clips.
+struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}; std::atomic<bool> dead{false}; };
+thread_local Dsp* t_new_dsp = nullptr;
+constexpr float kSr = 48000.0f;
+
+int dsp_create(void* st) {
+    Dsp* d = new (std::nothrow) Dsp();
+    if (!d) return 1;
+    *reinterpret_cast<void**>(static_cast<char*>(st) + 8) = d;   // FMOD_DSP_STATE.plugindata
+    t_new_dsp = d;
+    return 0;
+}
+int dsp_release(void* st) {
+    Dsp* d = nullptr;
+    if (rd(static_cast<char*>(st) + 8, &d, 8) && d) d->dead = true;   // the memory stays: a dangling pointer of ours must stay readable
+    return 0;
+}
+int dsp_reset(void*) { return 0; }
+int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* outch) {
+    if (outch) *outch = inch;
+    Dsp* d = *reinterpret_cast<Dsp**>(static_cast<char*>(st) + 8);
+    if (!d || inch < 1 || inch > 8) { if (in != out) memcpy(out, in, sizeof(float) * length * static_cast<size_t>(inch > 0 ? inch : 1)); return 0; }
+    static const float af = 1.0f - std::exp(-1.0f / (0.0007f * kSr)), rf = 1.0f - std::exp(-1.0f / (0.012f * kSr)),
+                       as = 1.0f - std::exp(-1.0f / (0.030f * kSr)), rs = 1.0f - std::exp(-1.0f / (0.060f * kSr)),
+                       al = 1.0f - std::exp(-6.2831853f * 700.0f / kSr);
+    const float k = d->k.load(), drive = d->drive.load(), mix = d->mix.load(), bias = d->bias.load(), gain = d->gain.load();
+    const float tb = std::tanh(bias);
+    for (unsigned i = 0; i < length; ++i)
+        for (int c = 0; c < inch; ++c) {
+            const float x = in[i * static_cast<unsigned>(inch) + static_cast<unsigned>(c)];
+            const float ax = x < 0 ? -x : x;
+            d->ef[c] += (ax - d->ef[c]) * (ax > d->ef[c] ? af : rf);
+            d->es[c] += (ax - d->es[c]) * (ax > d->es[c] ? as : rs);
+            float g = 1.0f + k * ((d->ef[c] + 1e-4f) / (d->es[c] + 1e-4f) - 1.0f);
+            g = g < 0.5f ? 0.5f : (g > 2.5f ? 2.5f : g);
+            const float y = x * g;
+            d->lp[c] += al * (y - d->lp[c]);
+            const float hp = y - d->lp[c];
+            float o = (y + mix * (std::tanh(drive * hp + bias) - tb) * 0.7f) * gain;
+            const float ao = o < 0 ? -o : o;
+            if (ao > 0.8f) o = (o < 0 ? -1.0f : 1.0f) * (0.8f + 0.2f * std::tanh((ao - 0.8f) / 0.2f));
+            out[i * static_cast<unsigned>(inch) + static_cast<unsigned>(c)] = o;
+        }
+    return 0;
+}
+typedef int (*CreateDspDescFn)(void*, const void*, void**);
+Dsp* make_dsp(void* sys, void** dsp_out) {
+    unsigned char desc[0xD8] = {};
+    *reinterpret_cast<unsigned*>(desc + 0x00) = 100;                 // pluginsdkversion
+    memcpy(desc + 4, "EngineSoundTiers", 17);                        // name[32]
+    *reinterpret_cast<unsigned*>(desc + 0x24) = 0x00010000;          // version
+    *reinterpret_cast<int*>(desc + 0x28) = 1;                        // numinputbuffers
+    *reinterpret_cast<int*>(desc + 0x2C) = 1;                        // numoutputbuffers
+    *reinterpret_cast<void**>(desc + 0x30) = reinterpret_cast<void*>(&dsp_create);
+    *reinterpret_cast<void**>(desc + 0x38) = reinterpret_cast<void*>(&dsp_release);
+    *reinterpret_cast<void**>(desc + 0x40) = reinterpret_cast<void*>(&dsp_reset);
+    *reinterpret_cast<void**>(desc + 0x48) = reinterpret_cast<void*>(&dsp_read);
+    t_new_dsp = nullptr;
+    void* dsp = nullptr;
+    const int r = reinterpret_cast<CreateDspDescFn>(g_game + kCreateDspDesc)(sys, desc, &dsp);
+    if (r != 0 || !dsp || !t_new_dsp) return nullptr;
+    *dsp_out = dsp;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) == 0) say("our own FMOD effect (pulse emphasis + rasp) is working");
+    return t_new_dsp;
+}
+struct Dp { float k, drive, mix, bias, gain_db; };
+const Dp kExhDp[4] = {{0, 1, 0, 0, 0}, {0.12f, 1.5f, 0.10f, 0.10f, 0}, {0.40f, 2.5f, 0.28f, 0.20f, 1.0f}, {0.80f, 3.5f, 0.55f, 0.30f, 2.0f}};
+const Dp kIntDp[4] = {{0, 1, 0, 0, 0}, {0.05f, 1.5f, 0.05f, 0.10f, 0}, {0.20f, 2.0f, 0.15f, 0.15f, 0.5f}, {0.45f, 3.0f, 0.35f, 0.25f, 1.0f}};
+
+struct Group { void* eq = nullptr; void* eq2 = nullptr; void* echo = nullptr; void* dist = nullptr; void* cdsp = nullptr; Dsp* cst = nullptr; unsigned serial = 0; };
 std::mutex g_gmu;
 std::unordered_map<void*, Group> g_groups;   // track channel groups that carry our effect
 
@@ -309,9 +401,20 @@ void apply(void* sys, void* grp, int cls) {
         fx = scaled((cls == 1 ? kExhFx : kIntFx)[tier], cls == 1 ? g_exh_amount.load() : g_int_amount.load());
     }
     auto clampf = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
+    Dp dp{};
+    {
+        const float rasp = clampf(g_rasp.load() * 4.0f, 0, 2.5f);
+        auto sdp = [&](const Dp& d, float a) { return Dp{d.k * a, d.drive, d.mix * a * rasp, d.bias, d.gain_db * a}; };
+        if (cls == 3) {
+            const Dp e = sdp(kExhDp[pick(1)], g_exh_amount.load()), i = sdp(kIntDp[pick(0)], g_int_amount.load());
+            dp = Dp{e.k * 0.6f + i.k * 0.4f, e.drive > i.drive ? e.drive : i.drive, e.mix * 0.6f + i.mix * 0.4f, e.bias, e.gain_db * 0.6f + i.gain_db * 0.4f};
+        } else dp = sdp((cls == 1 ? kExhDp : kIntDp)[tier], cls == 1 ? g_exh_amount.load() : g_int_amount.load());
+        dp.k = clampf(dp.k, 0, 1.5f); dp.mix = clampf(dp.mix, 0, 1.2f); dp.gain_db = clampf(dp.gain_db, 0, 6);
+    }
+    const bool dp_on = dp.k > 0 || dp.mix > 0 || dp.gain_db > 0;
     fx.low = clampf(fx.low, 0, 10); fx.mid = clampf(fx.mid, 0, 10); fx.high = clampf(fx.high, 0, 10); fx.band = clampf(fx.band, 0, 10);
     fx.dist = clampf(fx.dist, 0, 0.6f); fx.echo_wet = clampf(fx.echo_wet, -80, -6);
-    const bool nothing = fx.low == 0 && fx.mid == 0 && fx.high == 0 && fx.band == 0 && fx.dist == 0 && fx.echo_wet <= -80;
+    const bool nothing = !dp_on && fx.low == 0 && fx.mid == 0 && fx.high == 0 && fx.band == 0 && fx.echo_wet <= -80;
 
     const unsigned serial = g_cfg_serial.load();
     Group& g = g_groups[grp];
@@ -368,14 +471,22 @@ void apply(void* sys, void* grp, int cls) {
         setf(g.echo, 2, 0);
         setf(g.echo, 3, fx.echo_wet);
     }
-    if (fx.dist > 0 && !g.dist) {
-        void* ds = nullptr;
-        if (fn<CreateDspFn>(kCreateDsp)(sys, kDspDistortion, &ds) == 0 && ds) {
-            setf(ds, 0, fx.dist);
-            if (fn<AddDspFn>(kAddDsp)(grp, 0, ds) == 0) g.dist = ds;
-        }
+    if (dp_on && !g.cdsp) {
+        void* cd = nullptr;
+        Dsp* st = make_dsp(sys, &cd);
+        if (st && fn<AddDspFn>(kAddDsp)(grp, 0, cd) == 0) { g.cdsp = cd; g.cst = st; }
+        else if (!st && g_n_err.fetch_add(1) < 5) say("FMOD would not make our own effect (the grit falls back to FMOD's distortion)");
     }
-    if (g.dist) setf(g.dist, 0, fx.dist);
+    if (g.cst && !g.cst->dead.load()) {
+        g.cst->k = dp.k; g.cst->drive = dp.drive; g.cst->mix = dp.mix; g.cst->bias = dp.bias;
+        g.cst->gain = std::pow(10.0f, dp.gain_db / 20.0f);
+    } else if (dp_on && !g.cdsp && fx.dist > 0) {   // fallback: FMOD's own distortion, lightly
+        if (!g.dist) {
+            void* ds = nullptr;
+            if (fn<CreateDspFn>(kCreateDsp)(sys, kDspDistortion, &ds) == 0 && ds && fn<AddDspFn>(kAddDsp)(grp, 0, ds) == 0) g.dist = ds;
+        }
+        if (g.dist) setf(g.dist, 0, fx.dist * 0.4f);
+    }
 }
 
 int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
@@ -391,6 +502,30 @@ int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch)
     if (!g_all_cars.load()) {
         const int pg = g_bank_pg.load(), gs = g_bank_gs.load();
         if ((pg >= 0 || gs >= 0) && row != pg && row != gs) return r;   // another car's sound (when the driven car's bank is known)
+    }
+    if (cls == 4) {   // one of the game's backfire pops: with a better exhaust it is played once more (a "double crack", a little off in pitch)
+        int tier = g_exh_tier.load();
+        const int pv = g_preview.load();
+        if (pv >= 1 && pv <= 4) tier = pv - 1;
+        if (!g_enabled.load()) tier = 0;
+        static const float kP[4] = {0, 0.25f, 0.55f, 0.90f};
+        static uint32_t rng = 0x9E3779B9u;
+        static std::atomic<uint64_t> last{0};
+        auto rnd = [&] { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return static_cast<float>(rng & 0xFFFF) / 65535.0f; };
+        const uint64_t now = GetTickCount64();
+        const float p = kP[tier] * g_pops.load() * g_exh_amount.load();
+        if (p > 0 && now - last.load() > 45 && rnd() < p) {
+            last.store(now);
+            void* ch2 = nullptr;
+            if (g_orig_play(snd, sys, grp, paused, a5, &ch2) == 0 && ch2) {
+                fn<SetCtlFloatFn>(kSetPitch)(ch2, 0.90f + 0.20f * rnd());
+                fn<SetCtlFloatFn>(kSetVolume)(ch2, 0.55f + 0.30f * rnd());
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 3) say("extra pop played (level %d)", tier);
+            }
+        }
+        if (g_antilag) return r;   // the Anti-Lag mod owns the pop sound itself: its tone stays as it is
+        cls = 1;                   // without Anti-Lag the pop gets the exhaust's tone like the rest of the exhaust
     }
     // FMOD is called below: never wait for our own lock while the game may hold FMOD's
     std::unique_lock gl{g_gmu, std::try_to_lock};
@@ -422,6 +557,8 @@ DWORD WINAPI worker(LPVOID) {
     char* base = static_cast<char*>(g_api->wait_for_code(180000));
     if (!base) { say("the game was not mapped in time: doing nothing"); return 0; }
     g_game = base;
+    g_antilag = GetModuleHandleW(L"AntiLag.dll") != nullptr;
+    say(g_antilag ? "the Anti-Lag mod is installed: its pops are left as they are" : "the Anti-Lag mod is not installed: the game's pops get the exhaust tone");
     for (const Sig& s : kSigs) {
         unsigned char got[6] = {};
         if (!rd(base + s.rva, got, 6) || memcmp(got, s.b, 6) != 0) {
@@ -470,6 +607,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_int_amount = static_cast<float>(ini_int(L"IntakeAmount", 100)) / 100.0f;
     g_rasp       = static_cast<float>(ini_int(L"Rasp", 25)) / 100.0f;
     g_pipe       = ini_int(L"Pipe", 1);
+    g_pops       = static_cast<float>(ini_int(L"Pops", 100)) / 100.0f;
 
     FH3Setting s{};
     s.size = sizeof s;
@@ -507,6 +645,13 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     rs.description = "How much grit the higher levels add on top of the open, bright tone. 0 is none (clean), 100 is the mod's full grit, 200 is double. Too much sounds distorted.";
     rs.kind = FH3_SETTING_SLIDER; rs.min = 0; rs.max = 200; rs.step = 5; rs.slider_value = g_rasp.load() * 100.0f; rs.on_slide = on_slide;
     api->add_setting(g_mod, &rs);
+
+    FH3Setting po{};
+    po.size = sizeof po;
+    po.key = "Pops"; po.label = "Extra exhaust pops (%)";
+    po.description = "How much more the exhaust pops and crackles on a lift with better exhaust parts (Street a little, Race a lot). 0 is none, 200 is double. The game's own pop samples are played an extra time; the Anti-Lag mod's pops are not changed, they just come more often.";
+    po.kind = FH3_SETTING_SLIDER; po.min = 0; po.max = 200; po.step = 10; po.slider_value = g_pops.load() * 100.0f; po.on_slide = on_slide;
+    api->add_setting(g_mod, &po);
 
     FH3Setting pp{};
     pp.size = sizeof pp;
