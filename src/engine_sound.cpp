@@ -46,7 +46,7 @@ constexpr uintptr_t kSetFloat    = 0x27C5F10;   // FMOD::DSP::setParameterFloat(
 constexpr uintptr_t kHud         = 0xB26690;    // HUD speedometer controller update: the player's Car at +0x120
 constexpr size_t kCarExhaust = 0x7120, kCarIntake = 0x7124, kCarName = 0x118;
 
-constexpr int kDspDistortion = 9, kDspThreeEq = 28;   // FMOD_DSP_TYPE of FMOD 1.08 (the game's: 1.08.04)
+constexpr int kDspEcho = 6, kDspDistortion = 9, kDspThreeEq = 28;   // FMOD_DSP_TYPE of FMOD 1.08 (the game's: 1.08.04)
 
 struct Sig { uintptr_t rva; unsigned char b[6]; };
 const Sig kSigs[] = {
@@ -87,7 +87,8 @@ std::atomic<int> g_enabled{1};
 std::atomic<int> g_preview{0};          // 0 = the car's own parts, 1..4 = force Stock / Street / Sport / Race on both
 std::atomic<float> g_exh_amount{1.0f};  // 0 .. 2
 std::atomic<float> g_int_amount{1.0f};
-std::atomic<float> g_rasp{0.25f};        // 0 .. 2, scales the distortion (the rasp) of every level
+std::atomic<float> g_rasp{0.25f};
+std::atomic<int> g_pipe{1};             // pipe resonance (short echo) on the Sport / Race exhaust        // 0 .. 2, scales the distortion (the rasp) of every level
 std::atomic<int> g_all_cars{0};         // also other cars that use the same sound bank (they do anyway); 1 = every car on the road
 std::atomic<unsigned> g_cfg_serial{1};  // bumped when anything that changes the effect changes
 
@@ -101,6 +102,7 @@ void ini_set(const wchar_t* key, int v) {
 void on_change(void*, const char* key, int value) {
     if (!strcmp(key, "Enabled")) { g_enabled = value; ini_set(L"Enabled", value); }
     else if (!strcmp(key, "Preview")) { g_preview = value; ini_set(L"Preview", value); }
+    else if (!strcmp(key, "Pipe")) { g_pipe = value; ini_set(L"Pipe", value); }
     else if (!strcmp(key, "AllCars")) { g_all_cars = value; ini_set(L"AllCars", value); }
     g_cfg_serial.fetch_add(1);
 }
@@ -247,21 +249,32 @@ int classify(void* snd, int* row) {
 
 // ---- the effect ----------------------------------------------------------------------------------------------------------
 // Three-band EQ gains in dB (low / mid / high, crossovers 250 Hz and 2.5 kHz) and distortion level per upgrade level.
-struct Fx { float low, mid, high, dist, x1, x2; };   // gains in dB, distortion, crossovers in Hz
+// What changes on a real car, and how it is modelled with FMOD's own effects:
+//  - a muffler is a low-pass filter and a level drop: taking mufflers away gives level and top end back   -> "tilt" three-band EQ
+//  - without resonators the upper-mid harmonics (the rasp band, about 0.6 - 2 kHz) come through        -> a band boost (second EQ)
+//  - an open pipe rings: its length gives a comb of resonances (the hollow, tubular drone)             -> a very short echo, mixed low
+//  - an open intake is heard as induction growl in the low mids, ITBs bark higher                      -> band boost, lower / wider
+//  - grit: only a trace of distortion, on its own slider
+struct Fx {
+    float low, mid, high, x1, x2;   // tilt EQ: gains in dB, crossovers in Hz
+    float band, b1, b2;             // band boost in dB between b1 and b2 Hz
+    float echo_ms, echo_wet, echo_fb;   // pipe resonance: delay, wet level in dB (<= -80: none), feedback %
+    float dist;                     // distortion level (scaled by the Rasp slider)
+};
 // Exhaust: stock; sport rear muffler; sport rear + middle muffler; open straight-through system.
 const Fx kExhFx[4] = {
-    {0, 0, 0, 0, 250, 2500},               // stock: untouched
-    {0.5f, 3.0f, 3.0f, 0.03f, 250, 2200},  // street: sport rear muffler - less muffled, a bit louder, a touch of edge
-    {1.5f, 3.5f, 4.5f, 0.14f, 220, 2000},  // sport: rear + middle muffler - barking, rasp comes in
-    {3.0f, 4.5f, 7.5f, 0.42f, 200, 1800}}; // race: open system - raw, ragged, open; body kept in check
-// Intake: stock; sport panel filter; cone filter; ITB / mesh.
+    {0, 0, 0, 250, 2500, 0, 700, 1800, 12, -80, 0, 0},
+    {1.0f, 1.5f, 1.5f, 250, 2500, 1.5f, 700, 1800, 12, -80, 0, 0},              // a little louder and less muffled
+    {1.5f, 2.5f, 2.5f, 230, 2500, 3.0f, 600, 2000, 13, -19, 22, 0.10f},        // bark: upper mids open up, the pipe starts to ring
+    {2.5f, 3.0f, 4.5f, 210, 2600, 5.0f, 500, 2200, 11, -13, 32, 0.40f}};       // open pipe: loud, raspy band, hollow ring, bright
+// Intake (the engine-bay layer): stock; sport panel filter; cone filter; ITB / mesh.
 const Fx kIntFx[4] = {
-    {0, 0, 0, 0, 250, 2500},
-    {0, 1.5f, 3.0f, 0.02f, 300, 3000},     // street: induction hiss starts to show
-    {0.5f, 3.5f, 4.5f, 0.08f, 300, 2600},  // sport: cone filter - clear, loud induction howl
-    {1.5f, 5.0f, 7.5f, 0.25f, 250, 2000}}; // race: ITB - big induction roar with rasp
+    {0, 0, 0, 250, 2500, 0, 250, 700, 10, -80, 0, 0},
+    {0, 0.5f, 1.0f, 250, 3000, 2.0f, 250, 700, 10, -80, 0, 0},                 // a hint of induction growl
+    {0.5f, 1.0f, 1.5f, 250, 3000, 4.0f, 250, 900, 10, -80, 0, 0},              // cone filter: clear induction growl
+    {1.0f, 2.0f, 3.0f, 250, 2800, 6.0f, 300, 1200, 10, -80, 0, 0.20f}};        // ITB: loud bark, wider and higher
 
-struct Group { void* eq = nullptr; void* dist = nullptr; unsigned serial = 0; };
+struct Group { void* eq = nullptr; void* eq2 = nullptr; void* echo = nullptr; void* dist = nullptr; unsigned serial = 0; };
 std::mutex g_gmu;
 std::unordered_map<void*, Group> g_groups;   // track channel groups that carry our effect
 
@@ -275,29 +288,37 @@ void apply(void* sys, void* grp, int cls) {
         if (!g_enabled.load()) t = 0;
         return t;
     };
-    auto scaled = [&](const Fx& f, float a) { Fx r = f; r.low *= a; r.mid *= a; r.high *= a; r.dist *= a * g_rasp.load(); return r; };
+    auto scaled = [&](const Fx& f, float a) {
+        Fx r = f;
+        r.low *= a; r.mid *= a; r.high *= a; r.band *= a;
+        r.dist *= a * g_rasp.load();
+        if (a <= 0.01f || !g_pipe.load()) r.echo_wet = -80;
+        else if (r.echo_wet > -80) r.echo_wet += 8.0f * (a - 1.0f);   // amount 200% = 8 dB more ring, 50% = 4 dB less
+        return r;
+    };
     int tier;
     Fx fx;
-    if (cls == 3) {   // a granular engine's synthesised sound: exhaust and intake mixed in one track -> blend both effects
+    if (cls == 3) {   // a granular engine's synthesised sound: exhaust and intake in one track -> the exhaust's shape, some of the intake's tilt
         const int te = pick(1), ti = pick(0);
         tier = te > ti ? te : ti;
-        const Fx e = scaled(kExhFx[te], g_exh_amount.load()), i = scaled(kIntFx[ti], g_int_amount.load());
-        fx = {e.low * 0.6f + i.low * 0.4f, e.mid * 0.6f + i.mid * 0.4f, e.high * 0.6f + i.high * 0.4f, e.dist * 0.6f + i.dist * 0.4f,
-              kExhFx[te].x1, kExhFx[te].x2};
-        if (te == 0) { fx.x1 = kIntFx[ti].x1; fx.x2 = kIntFx[ti].x2; }
+        const Fx i = scaled(kIntFx[ti], g_int_amount.load());
+        fx = scaled(kExhFx[te], g_exh_amount.load());
+        fx.low += i.low * 0.4f; fx.mid += (i.mid + i.band) * 0.4f; fx.high += i.high * 0.4f; fx.dist += i.dist * 0.4f;
     } else {
         tier = pick(cls == 1);
         fx = scaled((cls == 1 ? kExhFx : kIntFx)[tier], cls == 1 ? g_exh_amount.load() : g_int_amount.load());
     }
     auto clampf = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
-    fx.low = clampf(fx.low, 0, 14); fx.mid = clampf(fx.mid, 0, 14); fx.high = clampf(fx.high, 0, 14); fx.dist = clampf(fx.dist, 0, 0.6f);
+    fx.low = clampf(fx.low, 0, 10); fx.mid = clampf(fx.mid, 0, 10); fx.high = clampf(fx.high, 0, 10); fx.band = clampf(fx.band, 0, 10);
+    fx.dist = clampf(fx.dist, 0, 0.6f); fx.echo_wet = clampf(fx.echo_wet, -80, -6);
+    const bool nothing = fx.low == 0 && fx.mid == 0 && fx.high == 0 && fx.band == 0 && fx.dist == 0 && fx.echo_wet <= -80;
 
     const unsigned serial = g_cfg_serial.load();
     Group& g = g_groups[grp];
     // Is our EQ still on this group? (A group's memory is reused for a new group when its event ends.)
     bool have = false;
     if (g.eq) {
-        for (int i = 0; i < 6 && !have; ++i) {
+        for (int i = 0; i < 8 && !have; ++i) {
             void* d = nullptr;
             if (fn<GetDspFn>(kGetDsp)(grp, i, &d) != 0) break;
             if (d == g.eq) have = true;
@@ -305,35 +326,56 @@ void apply(void* sys, void* grp, int cls) {
     }
     if (!have) {
         g = Group{};
-        if (fx.low == 0 && fx.mid == 0 && fx.high == 0 && fx.dist == 0) return;   // stock: the group stays untouched
+        if (nothing) return;   // stock: the group stays untouched
         void* eq = nullptr;
         int r = fn<CreateDspFn>(kCreateDsp)(sys, kDspThreeEq, &eq);
-        if (r == 0 && eq) {
-            r = fn<AddDspFn>(kAddDsp)(grp, 0, eq);
-        }
+        if (r == 0 && eq) r = fn<AddDspFn>(kAddDsp)(grp, 0, eq);
         if (r != 0 || !eq) {
             if (g_n_err.fetch_add(1) < 5) say("FMOD would not add the EQ to a track (error %d)", r);
             return;
         }
         g.eq = eq;
+        void* eq2 = nullptr;
+        if (fn<CreateDspFn>(kCreateDsp)(sys, kDspThreeEq, &eq2) == 0 && eq2 && fn<AddDspFn>(kAddDsp)(grp, 0, eq2) == 0) g.eq2 = eq2;
         const long n = g_n_groups.fetch_add(1) + 1;
         if (n <= 3 || n == 10 || n == 50) say("effect on %ld track(s) so far (this one: %s, level %d)", n, cls == 1 ? "exhaust" : (cls == 3 ? "granular synth" : "engine bay / intake"), tier);
     } else if (g.serial == serial)
         return;
     g.serial = serial;
-    fn<SetFloatFn>(kSetFloat)(g.eq, 3, fx.x1);   // low/mid crossover
-    fn<SetFloatFn>(kSetFloat)(g.eq, 4, fx.x2);   // mid/high crossover
-    fn<SetFloatFn>(kSetFloat)(g.eq, 0, fx.low);
-    fn<SetFloatFn>(kSetFloat)(g.eq, 1, fx.mid);
-    fn<SetFloatFn>(kSetFloat)(g.eq, 2, fx.high);
+    const SetFloatFn setf = fn<SetFloatFn>(kSetFloat);
+    setf(g.eq, 3, fx.x1);   // low/mid crossover
+    setf(g.eq, 4, fx.x2);   // mid/high crossover
+    setf(g.eq, 0, fx.low);
+    setf(g.eq, 1, fx.mid);
+    setf(g.eq, 2, fx.high);
+    if (g.eq2) {
+        setf(g.eq2, 3, fx.b1);
+        setf(g.eq2, 4, fx.b2);
+        setf(g.eq2, 0, 0);
+        setf(g.eq2, 1, fx.band);
+        setf(g.eq2, 2, 0);
+    }
+    if (fx.echo_wet > -80 && !g.echo) {
+        void* e = nullptr;
+        if (fn<CreateDspFn>(kCreateDsp)(sys, kDspEcho, &e) == 0 && e) {
+            setf(e, 3, -80.0f);
+            if (fn<AddDspFn>(kAddDsp)(grp, 0, e) == 0) g.echo = e;
+        }
+    }
+    if (g.echo) {   // FMOD Echo: 0 delay ms (10..), 1 feedback %, 2 dry level dB, 3 wet level dB
+        setf(g.echo, 0, clampf(fx.echo_ms, 10, 40));
+        setf(g.echo, 1, fx.echo_wet > -80 ? fx.echo_fb : 0);
+        setf(g.echo, 2, 0);
+        setf(g.echo, 3, fx.echo_wet);
+    }
     if (fx.dist > 0 && !g.dist) {
         void* ds = nullptr;
         if (fn<CreateDspFn>(kCreateDsp)(sys, kDspDistortion, &ds) == 0 && ds) {
-            fn<SetFloatFn>(kSetFloat)(ds, 0, fx.dist);
-            if (fn<AddDspFn>(kAddDsp)(grp, 1, ds) == 0) g.dist = ds;   // below the EQ: the EQ shapes the rasp too
+            setf(ds, 0, fx.dist);
+            if (fn<AddDspFn>(kAddDsp)(grp, 0, ds) == 0) g.dist = ds;
         }
     }
-    if (g.dist) fn<SetFloatFn>(kSetFloat)(g.dist, 0, fx.dist);
+    if (g.dist) setf(g.dist, 0, fx.dist);
 }
 
 int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
@@ -427,6 +469,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_exh_amount = static_cast<float>(ini_int(L"ExhaustAmount", 100)) / 100.0f;
     g_int_amount = static_cast<float>(ini_int(L"IntakeAmount", 100)) / 100.0f;
     g_rasp       = static_cast<float>(ini_int(L"Rasp", 25)) / 100.0f;
+    g_pipe       = ini_int(L"Pipe", 1);
 
     FH3Setting s{};
     s.size = sizeof s;
@@ -464,6 +507,13 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     rs.description = "How much grit the higher levels add on top of the open, bright tone. 0 is none (clean), 100 is the mod's full grit, 200 is double. Too much sounds distorted.";
     rs.kind = FH3_SETTING_SLIDER; rs.min = 0; rs.max = 200; rs.step = 5; rs.slider_value = g_rasp.load() * 100.0f; rs.on_slide = on_slide;
     api->add_setting(g_mod, &rs);
+
+    FH3Setting pp{};
+    pp.size = sizeof pp;
+    pp.key = "Pipe"; pp.label = "Pipe resonance";
+    pp.description = "The hollow ring of a freer exhaust pipe on the Sport and Race exhaust. Off: only the tone changes.";
+    pp.value = g_pipe.load(); pp.on_change = on_change;
+    api->add_setting(g_mod, &pp);
 
     FH3Setting a{};
     a.size = sizeof a;
