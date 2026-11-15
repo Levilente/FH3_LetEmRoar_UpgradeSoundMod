@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -638,6 +639,38 @@ int detour_synth(void* st, float* in, float* out, unsigned length, int inch, int
     return r;
 }
 
+// The sound graph is changed on our own thread, never inside the game's hook: the game thread may hold FMOD's lock (a car change) and an
+// FMOD call made from the hook could wait for it forever. A request is dropped if it has waited too long (its group may be gone by then).
+struct Req { void* sys; void* grp; int cls; bool gran; uint64_t t; };
+std::mutex g_qm;
+std::vector<Req> g_q;
+void enqueue(void* sys, void* grp, int cls, bool gran) {
+    std::scoped_lock lk{g_qm};
+    if (g_q.size() >= 256) return;
+    for (const Req& r : g_q) if (r.grp == grp) return;
+    g_q.push_back(Req{sys, grp, cls, gran, GetTickCount64()});
+}
+void drain() {
+    std::vector<Req> work;
+    {
+        std::scoped_lock lk{g_qm};
+        work.swap(g_q);
+    }
+    for (const Req& r : work) {
+        const uint64_t now = GetTickCount64();
+        if (now - r.t > 150) continue;                                            // stale: the group may be gone
+        if (now - g_hud_tick.load() > 1500 || now < g_busy_until.load()) continue;   // the game is loading
+        std::unique_lock gl{g_gmu, std::try_to_lock};
+        if (!gl.owns_lock()) continue;
+        const auto t0 = std::chrono::steady_clock::now();
+        apply(r.sys, r.grp, r.cls, r.gran);
+        const long us = static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+        g_n_apply.fetch_add(1);
+        long m = g_apply_max_us.load();
+        while (us > m && !g_apply_max_us.compare_exchange_weak(m, us)) {}
+    }
+}
+
 int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
     const int r = g_orig_play(snd, sys, grp, paused, a5, ch);
     g_n_play.fetch_add(1);
@@ -688,16 +721,7 @@ int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch)
             return r;
         }
     }
-    // FMOD is called below: never wait for our own lock while the game may hold FMOD's
-    std::unique_lock gl{g_gmu, std::try_to_lock};
-    if (gl.owns_lock()) {
-        const auto t0 = std::chrono::steady_clock::now();
-        apply(sys, grp, cls, gran);
-        const long us = static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
-        g_n_apply.fetch_add(1);
-        long m = g_apply_max_us.load();
-        while (us > m && !g_apply_max_us.compare_exchange_weak(m, us)) {}
-    }
+    enqueue(sys, grp, cls, gran);
     return r;
 }
 
@@ -715,8 +739,7 @@ int detour_play2(void* sys, void* snd, void* grp, bool paused, void** ch) {
     }
     if (!user) return r;
     if (g_play2_logged.fetch_add(1) < 6) say("granular synth sound played into group %p", grp);
-    std::unique_lock gl{g_gmu, std::try_to_lock};
-    if (gl.owns_lock()) apply(sys, grp, 3, true);
+    enqueue(sys, grp, 3, true);
     return r;
 }
 
@@ -753,8 +776,12 @@ DWORD WINAPI worker(LPVOID) {
     say("ready: %d car sound banks known; exhaust and intake sound now follow the car's parts", kBanks);
     // watchdog: while the game is busy loading (no HUD line then) say what the sound system is doing, so a slow load can be traced
     long c0 = 0, p0 = 0, a0 = 0;
+    uint64_t next = GetTickCount64() + 4000;
     for (;;) {
-        Sleep(4000);
+        Sleep(5);
+        drain();
+        if (GetTickCount64() < next) continue;
+        next += 4000;
         const long c = g_n_create.load(), p = g_n_play.load(), a = g_n_apply.load();
         if (c - c0 > 150) g_busy_until = GetTickCount64() + 6000;
         if (c - c0 > 300 || a - a0 > 300) {
