@@ -237,17 +237,15 @@ std::unordered_map<void*, int> g_user;   // sounds that are fed by a PCM callbac
 std::atomic<int> g_user_logged{0};
 
 int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex, void** out) {
-    void* const ra = __builtin_return_address(0);
     const int r = g_orig_create(sys, name, mode, ex, out);
-    if (r == 0 && out && *out && g_antilag_mod) {   // made by the Anti-Lag mod: one of its pop samples
-        HMODULE m = nullptr;
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(ra), &m) && m == g_antilag_mod) {
-            std::scoped_lock lk{g_mu};
-            g_pop.insert(*out);
-            static std::atomic<int> logged{0};
-            if (logged.fetch_add(1) < 3) say("an Anti-Lag pop sample noted");
-            return r;
-        }
+    // The Anti-Lag mod's pop samples are raw PCM held in memory (OPENMEMORY | OPENRAW); the game's bank samples never are. (The caller's
+    // module can not be used: with chained hooks every call may appear to come from the Anti-Lag mod.)
+    if (r == 0 && out && *out && g_antilag_mod && (mode & 0x800) && (mode & 0x1000)) {
+        std::scoped_lock lk{g_mu};
+        g_pop.insert(*out);
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 3) say("an Anti-Lag pop sample noted");
+        return r;
     }
     if (r != 0 || !out || !ex || !*out) return r;
     if (mode & 0x200) {   // FMOD_OPENUSER
