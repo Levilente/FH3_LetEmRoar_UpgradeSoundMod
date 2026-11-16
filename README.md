@@ -48,3 +48,7 @@ Turbo level = the installed forced induction part (PartEnum 24-28: single / twin
 
 ## 1.11.0
 The turbo layers are split in two: spool / whistle / whine (events with Boost + EngineRPM) and the short blow-off / flutter one-shots (Boost only). Engine tab, per car: Turbo / supercharger volume (%), Blow-off valve volume (%, 0 = off), Blow-off valve sound (0-15: always the same one of the car's blow-off samples), Intake air hiss (%, turbos only, louder now). Volume is a plain gain inside our own effect, so it works on every level.
+
+### 1.11.1
+- Intake air hiss now follows the turbo's boost pressure (not throttle x revs).
+- Diagnostic: logs how the game creates bank samples ("bank sample made: ...") - groundwork for choosing other cars' blow-off sounds.

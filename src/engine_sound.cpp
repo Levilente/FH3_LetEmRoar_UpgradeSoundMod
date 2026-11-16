@@ -103,7 +103,7 @@ std::atomic<float> g_int_amount{1.0f};
 std::atomic<float> g_rasp{0.25f};
 std::atomic<float> g_pops{1.0f};         // 0 .. 2, extra backfire pops
 std::atomic<float> g_pipe{1.0f};        // pipe resonance amount 0 .. 2 (short echo on the Sport / Race exhaust)
-std::atomic<float> g_air_amount{1.0f}, g_air{0.0f};   // intake air hiss: the car's amount 0 .. 2, and the level in force (follows throttle and revs)
+std::atomic<float> g_air_amount{1.0f}, g_air{0.0f}, g_boost{0.0f};   // intake air hiss: the car's amount 0 .. 2, and the level in force (follows throttle and revs)
 std::atomic<float> g_tur_amount{1.0f}, g_bov_amount{1.0f};
 std::atomic<int> g_bov_choice{0};
 std::atomic<bool> g_fi_turbo{false};   // the installed forced induction is a turbo (not a supercharger)     // turbo / boost layers' effect 0 .. 2
@@ -355,8 +355,14 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
                 {   // intake air hiss level: forced induction level x amount x throttle-and-rev load
                     static const float kLv[4] = {0, 0.5f, 0.8f, 1.0f};
                     const float lv = g_fi_turbo.load() ? kLv[g_tur_tier.load() & 3] * (g_enabled.load() ? 1.0f : 0.0f) * g_air_amount.load() : 0.0f;
-                    const float l = g_load.load();
-                    g_air = lv * std::pow(l, 1.5f) * (0.3f + 0.7f * g_thr.load());
+                    float bn = 0.0f;   // boost pressure 0..1 (dyn+0x620 between its rest value dyn+0xEF4 and its top dyn+0xEF8; as the Anti-Lag mod reads it)
+                    float bv = 0, bmin = 0, bmax = 0;
+                    if (rd(dyn + 0x620, &bv, 4) && rd(dyn + 0xEF4, &bmin, 4) && rd(dyn + 0xEF8, &bmax, 4) && bv == bv && bmin == bmin && bmax == bmax && bmax - bmin > 1e-3f) {
+                        bn = (bv - bmin) / (bmax - bmin);
+                        bn = bn < 0 ? 0 : (bn > 1 ? 1 : bn);
+                    }
+                    g_boost = g_boost.load() + (bn - g_boost.load()) * 0.3f;
+                    g_air = lv * std::pow(g_boost.load(), 1.2f);
                 }
             }
         }
@@ -434,6 +440,20 @@ int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex,
     int row = -1;
     for (int i = 0; i < kBanks; ++i)
         if (kBankTier[i].off == off && kBankTier[i].len == len) { row = i; break; }
+    {   // how the game makes a bank's sample (to be able to make another bank's blow-off sample ourselves)
+        static std::atomic<int> dumped{0};
+        if (row >= 0 && dumped.fetch_add(1) < 3) {
+            char nm[200] = {};
+            if (!(mode & 0x800) && name) rd(name, nm, 199);
+            char b[900];
+            int o = _snprintf(b, sizeof b, "bank sample made: mode 0x%X, name \"%s\", exinfo size 0x%X:", mode, nm, cb);
+            for (int k = 0; k + 8 <= cb && k < 0xE0 && o > 0 && o < 800; k += 8) {
+                uint64_t q = 0;
+                if (rd(ex + k, &q, 8) && q) o += _snprintf(b + o, sizeof b - o, " +%X=%llX", k, static_cast<unsigned long long>(q));
+            }
+            say("%s", b);
+        }
+    }
     std::scoped_lock lk{g_mu};
     if (row < 0) g_made.erase(*out);
     else {
