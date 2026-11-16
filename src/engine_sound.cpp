@@ -824,10 +824,12 @@ DWORD WINAPI worker(LPVOID) {
     say(g_antilag ? "the Anti-Lag mod is installed: its pops are left as they are" : "the Anti-Lag mod is not installed: the game's pops get the exhaust tone");
     for (const Sig& s : kSigs) {
         unsigned char got[6] = {};
-        if (!rd(base + s.rva, got, 6) || memcmp(got, s.b, 6) != 0) {
+        // Another mod may already have hooked this function (the platform's patch is a jump): that is not "another game build".
+        if (!rd(base + s.rva, got, 6) || (memcmp(got, s.b, 6) != 0 && !(got[0] == 0xE9 || got[0] == 0xEB || (got[0] == 0xFF && got[1] == 0x25)))) {
             say("the game's code at +0x%llX is not what this mod expects (another game build?): doing nothing", static_cast<unsigned long long>(s.rva));
             return 0;
         }
+        if (memcmp(got, s.b, 6) != 0) say("the game's code at +0x%llX is already patched by another mod (%02X %02X ...): hooking it through the platform", static_cast<unsigned long long>(s.rva), got[0], got[1]);
     }
     // Diagnostic switch (EngineSoundTiers.ini, Skip=): a sum of 1 createSound, 2 Studio play, 4 playSound, 8 synth, 16 HUD hooks to leave out
     // (to find which part of this mod a freeze comes from); 32 = make no changes to the sound graph, 64 = no own effect, 128 = no echo.
