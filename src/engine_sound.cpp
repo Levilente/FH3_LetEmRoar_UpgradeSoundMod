@@ -133,7 +133,7 @@ std::atomic<float> g_thr{0.0f};
 std::atomic<float> g_rpm_peak{0.0f};
 constexpr size_t kCarIface = 0x71E8, kIfaceToDyn = 0x4B0, kDynThrottle = 0x1BD0, kDynOmega = 0x5F8;   // as the Anti-Lag mod reads them
 std::atomic<int> g_bank_pg{-1}, g_bank_gs{-1};
-bool g_no_graph = false;
+bool g_no_graph = false, g_no_own_dsp = false, g_no_echo = false;
 std::atomic<uint64_t> g_hud_tick{0}, g_busy_until{0};   // the HUD ticks every frame in the world, never on a loading screen
 std::atomic<long> g_dc[5]{};   // diagnostics for the driven car: plays classified as other / exhaust / engine bay
 std::atomic<uint64_t> g_dnext{0};
@@ -503,7 +503,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
         } else dp = sdp((cls == 1 ? kExhDp : kIntDp)[tier], cls == 1 ? g_exh_amount.load() : g_int_amount.load());
         dp.k = clampf(dp.k, 0, 1.5f); dp.mix = clampf(dp.mix, 0, 1.2f); dp.gain_db = clampf(dp.gain_db, 0, 6);
     }
-    const bool dp_on = !gran && (dp.k > 0 || dp.mix > 0 || dp.gain_db > 0);   // granular cars: the EQ only (their loading stuck with our own effect)
+    const bool dp_on = !g_no_own_dsp && !gran && (dp.k > 0 || dp.mix > 0 || dp.gain_db > 0);   // granular cars: the EQ only (their loading stuck with our own effect)
     fx.low = clampf(fx.low, 0, 10); fx.mid = clampf(fx.mid, 0, 10); fx.high = clampf(fx.high, 0, 10); fx.band = clampf(fx.band, 0, 10);
     fx.dist = clampf(fx.dist, 0, 0.6f); fx.echo_wet = clampf(fx.echo_wet, -80, -6);
     const bool nothing = !dp_on && fx.low == 0 && fx.mid == 0 && fx.high == 0 && fx.band == 0 && fx.echo_wet <= -80;
@@ -550,7 +550,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
         setf(g.eq2, 1, fx.band);
         setf(g.eq2, 2, 0);
     }
-    if (fx.echo_wet > -80 && !g.echo) {
+    if (!g_no_echo && fx.echo_wet > -80 && !g.echo) {
         void* e = nullptr;
         if (fn<CreateDspFn>(kCreateDsp)(sys, kDspEcho, &e) == 0 && e) {
             setf(e, 3, -80.0f);
@@ -761,11 +761,13 @@ DWORD WINAPI worker(LPVOID) {
         }
     }
     // Diagnostic switch (EngineSoundTiers.ini, Skip=): a sum of 1 createSound, 2 Studio play, 4 playSound, 8 synth, 16 HUD hooks to leave out
-    // (to find which part of this mod a freeze comes from); 32 = make no changes to the sound graph.
+    // (to find which part of this mod a freeze comes from); 32 = make no changes to the sound graph, 64 = no own effect, 128 = no echo.
     const int skip = ini_int(L"Skip", 0);
     if (skip) say("diagnostic: Skip=%d (hooks left out: %s%s%s%s%s%s)", skip, skip & 1 ? "createSound " : "", skip & 2 ? "studio-play " : "", skip & 4 ? "playSound " : "",
                   skip & 8 ? "synth " : "", skip & 16 ? "HUD " : "", skip & 32 ? "no-graph" : "");
     g_no_graph = (skip & 32) != 0;
+    g_no_own_dsp = (skip & 64) != 0;
+    g_no_echo = (skip & 128) != 0;
     auto hk = [&](int bit, const char* nm, uintptr_t rva, void* det, void** orig) -> FH3Hook* {
         if (skip & bit) return reinterpret_cast<FH3Hook*>(1);
         return g_api->hook_function(g_mod, nm, base + rva, det, orig);
