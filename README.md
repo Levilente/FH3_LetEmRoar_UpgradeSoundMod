@@ -96,3 +96,6 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 
 ### 1.12.1
 - The turbo whistle no longer drops back to the game's quiet level after a while: its effect set is never taken over by newer tracks (a looping turbo sound is set up only once, so it looked "unused").
+
+### 1.13.0
+- Supercharger whine for supercharged cars only (the game has none): positive-displacement (Roots/screw) blowers whine at the rotor-lobe frequency with rich harmonics, centrifugal ones whistle rising with the square of the revs. A faint whine on a stock blower; every level spins a bigger blower faster: higher, louder, richer. Volume = the Turbo / supercharger volume slider. Made once (one effect instance), only from live physics.

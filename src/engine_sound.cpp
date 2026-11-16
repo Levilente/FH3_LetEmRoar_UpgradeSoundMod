@@ -124,8 +124,48 @@ float air_gain(void* self, bool sounding) {
     }
     g_air_owner_t = now;
     return a * 0.5f;
-}   // a supercharger is installed
-std::atomic<float> g_whl_amp{0.0f}, g_whl_freq{3000.0f};   // synthesised turbo whistle / supercharger whine (level, Hz)
+}
+std::atomic<float> g_whl_amp{0.0f}, g_whl_freq{3000.0f}, g_sc_rich{0.2f};   // synthesised supercharger whine (level, fundamental Hz, harmonics)
+std::atomic<bool> g_sc_cent{false};   // the supercharger is a centrifugal one (else positive displacement: Roots / twin-screw)
+// The supercharger whine: made by one effect instance at a time, like the hiss (see air_gain)
+std::atomic<void*> g_sc_owner{nullptr};
+std::atomic<uint64_t> g_sc_owner_t{0};
+
+struct ScSyn { float ph = 0, f = 0, a = 0, nl = 0, nb = 0, nb2 = 0; uint32_t rng = 0x1F2E3D4Cu; };
+ScSyn g_scs;   // only the owner touches it
+float sc_next() {   // one mono sample of the whine
+    ScSyn& s = g_scs;
+    constexpr float sr = 48000.0f;
+    s.f += (g_whl_freq.load() - s.f) * 0.0012f;   // the pitch glides with the revs
+    s.a += (g_whl_amp.load() - s.a) * 0.0012f;
+    if (s.a < 1e-5f) return 0.0f;
+    s.rng ^= s.rng << 13; s.rng ^= s.rng >> 17; s.rng ^= s.rng << 5;
+    const float nz = static_cast<float>(s.rng & 0xFFFF) / 32768.0f - 1.0f;
+    s.nl += 0.0008f * (nz - s.nl);   // very slow wander: a belt and bearings are never perfectly steady
+    s.ph += 6.2831853f * s.f * (1.0f + 0.004f * s.nl * 20.0f) / sr;
+    if (s.ph > 6.2831853f) s.ph -= 6.2831853f;
+    const float r = g_sc_rich.load();
+    float y;
+    s.nb += 0.35f * (nz - s.nb); s.nb2 += 0.08f * (s.nb - s.nb2);
+    const float air = s.nb - s.nb2;   // band noise (the air through the rotors / impeller)
+    if (g_sc_cent.load()) {   // centrifugal: a clean rising whistle with a little air
+        y = std::sin(s.ph) + 0.12f * r * std::sin(2.0f * s.ph) + air * (0.25f + 0.4f * r);
+    } else {                  // Roots / screw: the lobes' whine, rich in harmonics, with a gritty air pulse on every lobe
+        const float p1 = std::sin(s.ph), p2 = std::sin(2.0f * s.ph), p3 = std::sin(3.0f * s.ph), p4 = std::sin(4.0f * s.ph);
+        y = p1 + 0.55f * r * p2 + 0.35f * r * r * p3 + 0.2f * r * r * p4 + air * (0.3f + 0.6f * r) * (0.6f + 0.4f * p1);
+    }
+    return y * s.a;
+}
+bool sc_on(void* self, bool sounding) {
+    const uint64_t now = GetTickCount64();
+    if (now - g_air_tick.load() > 250 || (g_whl_amp.load() < 1e-5f && g_scs.a < 1e-5f)) return false;
+    if (g_sc_owner.load() != self) {
+        if (now - g_sc_owner_t.load() <= 120 || !sounding) return false;
+        g_sc_owner = self;
+    }
+    g_sc_owner_t = now;
+    return true;
+}
 std::atomic<bool> g_fi_turbo{false};   // the installed forced induction is a turbo (not a supercharger)     // turbo / boost layers' effect 0 .. 2
 std::atomic<int> g_tur_tier{0};
 std::atomic<int> g_ov_exh{0}, g_ov_int{0};   // the driven car's chosen sound type: 0 = as installed, 1..4 = Stock / Street / Sport / Race
@@ -322,6 +362,7 @@ void car_seen(char* car) {
         g_tur_tier = lv;
         g_fi_turbo = fi[0] >= 0 || fi[1] >= 0 || fi[2] >= 0;
         g_fi_sc = fi[3] >= 0 || fi[4] >= 0;
+        g_sc_cent = fi[3] >= 0;
     }
     const char* engine = name;
     const char* gran = nullptr;
@@ -412,14 +453,26 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
                         g_whl_freq = 2200.0f + 5200.0f * b;
                     } else if (g_fi_sc.load()) {
                         g_air = 0;
-                        g_whl_amp = 0;
-                        g_whl_freq = 900.0f + 3600.0f * rn;
+                        // a bigger blower turned faster (a smaller pulley) at every level: higher pitch, louder, richer. Stock = a faint whine.
+                        static const float kPdRatio[4] = {1.9f, 2.25f, 2.6f, 3.0f}, kPdAmp[4] = {0.004f, 0.012f, 0.02f, 0.03f};
+                        static const float kCnStep[4] = {26.0f, 32.0f, 38.0f, 46.0f}, kCnAmp[4] = {0.003f, 0.01f, 0.017f, 0.026f};
+                        const float rps = rpm > 0 ? rpm / 60.0f : 0.0f;
+                        const float ta = g_tur_amount.load();
+                        const float vol = en * std::pow(ta, 1.6f);
+                        if (g_sc_cent.load()) {   // the impeller's speed (and its boost) climbs with the square of the revs
+                            g_whl_freq = rps * kCnStep[tr];
+                            g_whl_amp = kCnAmp[tr] * vol * rn * rn * (0.35f + 0.65f * g_load.load());
+                        } else {                  // 3-lobe rotors x2: 6 pulses per rotor turn; heard even off throttle (bypass), more on load
+                            g_whl_freq = rps * kPdRatio[tr] * 6.0f;
+                            g_whl_amp = kPdAmp[tr] * vol * (0.3f + 0.7f * rn) * (0.25f + 0.75f * g_load.load());
+                        }
+                        g_sc_rich = 0.25f + 0.25f * static_cast<float>(tr);
                     } else { g_air = 0; g_whl_amp = 0; }
-                    if (frozen) { g_air = 0; g_boost = 0; }
+                    if (frozen) { g_air = 0; g_boost = 0; g_whl_amp = 0; }
                     else g_air_tick = GetTickCount64();
                     static std::atomic<uint64_t> tnext{0};
                     const uint64_t tn = GetTickCount64();
-                    if ((g_fi_turbo.load() || g_fi_sc.load()) && tn > tnext.load() && b > 0.02f) { tnext = tn + 5000; say("boost %.2f (raw %.2f, seen %.2f .. %.2f): hiss %.3f, whistle %.4f at %.0f Hz", b, bv, bmn, bpk, g_air.load(), g_whl_amp.load(), g_whl_freq.load()); }
+                    if ((g_fi_turbo.load() || g_fi_sc.load()) && tn > tnext.load() && (b > 0.02f || g_whl_amp.load() > 1e-4f)) { tnext = tn + 5000; say("boost %.2f (raw %.2f, seen %.2f .. %.2f): hiss %.3f, supercharger whine %.4f at %.0f Hz", b, bv, bmn, bpk, g_air.load(), g_whl_amp.load(), g_whl_freq.load()); }
                 }
             }
         }
@@ -620,7 +673,7 @@ inline float ftanh(float x) {
     const float x2 = x * x;
     return x * (27.0f + x2) / (27.0f + 9.0f * x2);
 }
-struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}, floor{0.4f}, vol{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}, nl[8] = {}, nh[8] = {}; uint32_t rng = 0x2545F491u; float ph = 0, ph2 = 0; std::atomic<bool> air{false}, dead{false}; std::atomic<int> kind{0}; float airg_now = 0; };
+struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}, floor{0.4f}, vol{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}, nl[8] = {}, nh[8] = {}; uint32_t rng = 0x2545F491u; float ph = 0, ph2 = 0; std::atomic<bool> air{false}, dead{false}; std::atomic<int> kind{0}; float airg_now = 0; bool sc_now = false; };
 thread_local Dsp* t_new_dsp = nullptr;
 constexpr float kSr = 48000.0f;
 
@@ -646,7 +699,8 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
         float mx = 0;
         for (unsigned i = 0; i < n; ++i) { const float a = in[i] < 0 ? -in[i] : in[i]; mx = a > mx ? a : mx; }
         d->airg_now = d->air.load() ? air_gain(d, mx >= 1e-5f) : 0.0f;
-        if (mx < 1e-5f && d->airg_now <= 0) { if (in != out) memcpy(out, in, sizeof(float) * n); return 0; }   // (the hiss goes on over a silent intake)
+        d->sc_now = d->air.load() && g_fi_sc.load() && sc_on(d, mx >= 1e-5f);
+        if (mx < 1e-5f && d->airg_now <= 0 && !d->sc_now) { if (in != out) memcpy(out, in, sizeof(float) * n); return 0; }   // (the hiss goes on over a silent intake)
     }
     static const float af = 1.0f - std::exp(-1.0f / (0.0007f * kSr)), rf = 1.0f - std::exp(-1.0f / (0.012f * kSr)),
                        as = 1.0f - std::exp(-1.0f / (0.030f * kSr)), rs = 1.0f - std::exp(-1.0f / (0.060f * kSr)),
@@ -667,17 +721,10 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
     const float tb = ftanh(bias);
     const float lim = d->kind.load() >= 5 ? 9.0f : 0.8f;   // turbo / blow-off layers: no soft limiter (a loud setting must stay louder)
     const float airg = d->airg_now;
-    const float wamp = d->air.load() ? g_whl_amp.load() : 0.0f;
-    const float wfreq = g_whl_freq.load();
-    const float wstep = 6.2831853f * wfreq / kSr;   // intake air hiss: band-limited noise, 1.5 .. 7 kHz
+    const bool scw = d->sc_now;   // intake air hiss: band-limited noise, 1.5 .. 7 kHz
     static const float nlp = 1.0f - std::exp(-6.2831853f * 7000.0f / kSr), nhp = 1.0f - std::exp(-6.2831853f * 1500.0f / kSr);
     for (unsigned i = 0; i < length; ++i) {
-        float wh = 0;
-        if (wamp > 0.0005f) {   // turbo whistle: a pure tone plus its octave, a little airy
-            d->ph += wstep; if (d->ph > 6.2831853f) d->ph -= 6.2831853f;
-            d->ph2 += wstep * 2.01f; if (d->ph2 > 6.2831853f) d->ph2 -= 6.2831853f;
-            wh = (std::sin(d->ph) + 0.35f * std::sin(d->ph2)) * wamp;
-        }
+        const float wh = scw ? sc_next() : 0.0f;   // the supercharger whine
         for (int c = 0; c < inch; ++c) {
             const float x = in[i * static_cast<unsigned>(inch) + static_cast<unsigned>(c)];
             const float ax = x < 0 ? -x : x;
@@ -752,7 +799,9 @@ void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) 
     Dsp& d = in.d;
     const float airg = (g_fi_turbo.load() && g_enabled.load()) ? air_gain(&in, true) : 0.0f;   // the intake air hiss of a turbo car (a granular engine has one track: it goes in here)
     static const float nlp = 1.0f - std::exp(-6.2831853f * 7000.0f / kSr), nhp = 1.0f - std::exp(-6.2831853f * 1500.0f / kSr);
-    for (unsigned i = 0; i < frames; ++i)
+    const bool scw = g_fi_sc.load() && g_enabled.load() && sc_on(&in, true);
+    for (unsigned i = 0; i < frames; ++i) {
+        const float wh = scw ? sc_next() : 0.0f;   // the supercharger whine
         for (int c = 0; c < ch; ++c) {
             float x = buf[i * static_cast<unsigned>(ch) + static_cast<unsigned>(c)];
             in.l1[c] += a1 * (x - in.l1[c]);
@@ -777,8 +826,9 @@ void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) 
                 d.nh[c] += nhp * (d.nl[c] - d.nh[c]);
                 o += (d.nl[c] - d.nh[c]) * airg;
             }
-            buf[i * static_cast<unsigned>(ch) + static_cast<unsigned>(c)] = o;
+            buf[i * static_cast<unsigned>(ch) + static_cast<unsigned>(c)] = o + wh;
         }
+    }
 }
 
 struct Group { void* eq = nullptr; void* eq2 = nullptr; void* echo = nullptr; void* dist = nullptr; void* cdsp = nullptr; Dsp* cst = nullptr; unsigned serial = 0; uint64_t last = 0; int cls = 0; };
@@ -962,7 +1012,7 @@ int detour_synth(void* st, float* in, float* out, unsigned length, int inch, int
     int ch = outch ? *outch : inch;
     if (r != 0 || !out || length == 0 || length > 4096 || ch < 1 || ch > 8) return r;
     const int te = synth_tier(1), ti = synth_tier(0);
-    if (te == 0 && ti == 0 && !(g_fi_turbo.load() && g_enabled.load() && g_air.load() > 0.002f && GetTickCount64() - g_air_tick.load() < 250)) return r;   // stock sound and no hiss to add: left alone
+    if (te == 0 && ti == 0 && !(g_fi_turbo.load() && g_enabled.load() && (g_air.load() > 0.002f || g_whl_amp.load() > 1e-5f) && GetTickCount64() - g_air_tick.load() < 250)) return r;   // stock sound and no hiss to add: left alone
     const float ea = g_exh_amount.load(), ia = g_int_amount.load(), rasp = g_rasp.load() * 4.0f > 2.5f ? 2.5f : g_rasp.load() * 4.0f;
     const Fx &fe = kExhFx[te], &fi = kIntFx[ti];
     const Dp &de = kExhDp[te], &di = kIntDp[ti];
@@ -1296,7 +1346,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
              "The hollow ring of a freer exhaust pipe on the Sport and Race exhaust. 0 is none, 100 is the mod's own, 200 is double.",
              0, 200, 5, 0, [](void*) { return sel_get(5); }, [](void*, float v) { sel_set(5, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "TurboAmount", "Engine sound|Turbo / supercharger volume (%)",
-             "The spool, whistle or whine of the turbo or supercharger: louder and airier with a better part. 0 is silent, 100 is the mod's own, 200 is double.",
+             "The game's own turbo sound, and the supercharger whine the mod adds (faint on a stock blower, higher, louder and richer with every level). 0 is silent, 100 is the mod's own, 200 is about three times.",
              0, 200, 5, 0, [](void*) { return sel_get(7); }, [](void*, float v) { sel_set(7, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "BovAmount", "Engine sound|Blow-off valve volume (%)",
              "The blow-off / flutter after you lift off the throttle. 0 turns it off, 100 is the mod's own, 200 is double.",
