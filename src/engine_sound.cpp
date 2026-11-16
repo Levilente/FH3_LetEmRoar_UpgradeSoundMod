@@ -376,10 +376,11 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
                         if (span > 1.0f) { bn = (bv - bmn) / span; bn = bn < 0 ? 0 : (bn > 1 ? 1 : bn); }
                     }
                     (void)bmin;
-                    g_boost = g_boost.load() + (bn - g_boost.load()) * 0.25f;
+                    bn = bn < 0.12f ? 0.0f : std::pow((bn - 0.12f) / 0.88f, 1.5f);   // a dead zone near idle pressure and a steeper curve: partial boost is clearly quieter
+                    g_boost = g_boost.load() + (bn - g_boost.load()) * 0.4f;
                     const float b = g_boost.load();
                     if (g_fi_turbo.load()) {
-                        g_air = kLv[tr] * en * g_air_amount.load() * std::pow(b, 1.1f);
+                        g_air = kLv[tr] * en * g_air_amount.load() * b;
                         g_whl_amp = 0;
                         g_whl_freq = 2200.0f + 5200.0f * b;
                     } else if (g_fi_sc.load()) {
@@ -629,7 +630,7 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
         (void)kTv; (void)kBv; (void)t;
         if (kd == 5) {   // 100% = the game's own level; 200% about 3x; the game's own loudness curve stays
             const float b = g_boost.load();
-            vl = std::pow(g_tur_amount.load(), 2.6f) * (0.2f + 0.8f * std::pow(b, 0.7f));   // 200% = about 6x at full boost
+            vl = std::pow(g_tur_amount.load(), 2.6f) * (0.05f + 0.95f * b);   // 200% = about 6x at full boost
         } else if (kd == 6) vl = std::pow(g_bov_amount.load(), 2.6f);
         vl = vl < 0 ? 0 : (vl > 8.0f ? 8.0f : vl);
     }
