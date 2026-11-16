@@ -930,7 +930,7 @@ int detour_synth(void* st, float* in, float* out, unsigned length, int inch, int
     int ch = outch ? *outch : inch;
     if (r != 0 || !out || length == 0 || length > 4096 || ch < 1 || ch > 8) return r;
     const int te = synth_tier(1), ti = synth_tier(0);
-    if (te == 0 && ti == 0) return r;
+    if (te == 0 && ti == 0 && !(g_fi_turbo.load() && g_enabled.load() && g_air.load() > 0.002f)) return r;   // stock sound and no hiss to add: left alone
     const float ea = g_exh_amount.load(), ia = g_int_amount.load(), rasp = g_rasp.load() * 4.0f > 2.5f ? 2.5f : g_rasp.load() * 4.0f;
     const Fx &fe = kExhFx[te], &fi = kIntFx[ti];
     const Dp &de = kExhDp[te], &di = kIntDp[ti];

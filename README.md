@@ -84,3 +84,6 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 
 ### 1.11.10
 - Turbo volume: 100% is now what 200% was (6x at full boost), 200% about 18x; no soft limiter on turbo / blow-off layers (it flattened the difference); blow-off 100% 3x.
+
+### 1.11.11
+- Granular engines with stock exhaust and intake (types 0/0 / stock parts) skipped the whole effect, hiss included: the hiss now still runs there.
