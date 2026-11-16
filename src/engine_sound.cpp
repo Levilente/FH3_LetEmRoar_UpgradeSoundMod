@@ -758,6 +758,62 @@ int detour_play2(void* sys, void* snd, void* grp, bool paused, void** ch) {
     return r;
 }
 
+// ---- hang dumps ----------------------------------------------------------------------------------------------------------------
+// If the game freezes (its window stops responding, or nothing at all happens in the sound system for a long time after the world was
+// running) a minidump with every thread's stack is written to fh3-mods\crashes, so the freeze can be traced to the thread and function.
+typedef BOOL(WINAPI* MiniDumpFn)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+typedef BOOL(WINAPI* IsHungFn)(HWND);
+struct FindWin { DWORD pid; HWND w; };
+BOOL CALLBACK enum_win(HWND h, LPARAM lp) {
+    auto* f = reinterpret_cast<FindWin*>(lp);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == f->pid && IsWindowVisible(h) && !GetWindow(h, GW_OWNER)) { f->w = h; return FALSE; }
+    return TRUE;
+}
+void write_hang_dump(const char* why) {
+    static int n = 0;
+    if (n >= 4) return;
+    ++n;
+    HMODULE dh = LoadLibraryW(L"dbghelp.dll");
+    auto md = dh ? reinterpret_cast<MiniDumpFn>(GetProcAddress(dh, "MiniDumpWriteDump")) : nullptr;
+    if (!md) { say("hang detected (%s), but dbghelp is not available", why); return; }
+    wchar_t path[MAX_PATH];
+    _snwprintf(path, MAX_PATH, L"%ls\\fh3-mods\\crashes\\EngineSoundTiers-hang-%llu.dmp", g_api->azimuth_dir, static_cast<unsigned long long>(GetTickCount64() / 1000));
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { say("hang detected (%s), but the dump file could not be created", why); return; }
+    // MiniDumpWithThreadInfo (0x1000) | MiniDumpWithIndirectlyReferencedMemory (0x40) | MiniDumpWithUnloadedModules (0x20)
+    const BOOL ok = md(GetCurrentProcess(), GetCurrentProcessId(), f, 0x1000 | 0x40 | 0x20, nullptr, nullptr, nullptr);
+    CloseHandle(f);
+    say("hang detected (%s): %s written to fh3-mods\\crashes (EngineSoundTiers-hang-*.dmp)", why, ok ? "a dump was" : "a dump could NOT be");
+}
+
+DWORD WINAPI hang_watch(LPVOID) {
+    uint64_t next_hang = GetTickCount64() + 1000, last_act = GetTickCount64();
+    long hc = 0;
+    uint64_t hh = 0;
+    int hung_n = 0;
+    bool armed = true;
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    auto is_hung = u32 ? reinterpret_cast<IsHungFn>(GetProcAddress(u32, "IsHungAppWindow")) : nullptr;
+    FindWin fw{GetCurrentProcessId(), nullptr};
+    for (;;) {
+        Sleep(500);
+        const uint64_t tn = GetTickCount64();
+        if (tn >= next_hang) {
+            next_hang = tn + 1000;
+            const long c = g_n_create.load() + g_n_play.load();
+            if (c != hc || g_hud_tick.load() != hh) { hc = c; hh = g_hud_tick.load(); last_act = tn; armed = true; }
+            if (!fw.w || !IsWindow(fw.w)) { fw.w = nullptr; EnumWindows(enum_win, reinterpret_cast<LPARAM>(&fw)); }
+            const bool hung = is_hung && fw.w && is_hung(fw.w);
+            hung_n = hung ? hung_n + 1 : 0;
+            if (armed && hung_n >= 8) { armed = false; write_hang_dump("the game window is not responding"); }
+            else if (armed && hh != 0 && tn - last_act > 90000) { armed = false; write_hang_dump("no sound activity for 90 s after the world was running"); }
+        }
+    }
+    return 0;
+}
+
 // ---- start ---------------------------------------------------------------------------------------------------------------
 DWORD WINAPI worker(LPVOID) {
     char* base = static_cast<char*>(g_api->wait_for_code(180000));
@@ -799,6 +855,7 @@ DWORD WINAPI worker(LPVOID) {
     // watchdog: while the game is busy loading (no HUD line then) say what the sound system is doing, so a slow load can be traced
     long c0 = 0, p0 = 0, a0 = 0;
     uint64_t next = GetTickCount64() + 4000;
+    CreateThread(nullptr, 0, hang_watch, nullptr, 0, nullptr);   // its own thread: this one may be the one that is stuck
     for (;;) {
         Sleep(5);
         drain();
