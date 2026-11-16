@@ -42,3 +42,6 @@ Turbo / boost layers: airier instead of echoing (the top end opens with the leve
 
 ## 1.9.2
 Turbo layers: much stronger lift (+4.5 / +7 / +10 dB at Race), the 60 s diagnostics line counts the turbo samples played.
+
+## 1.10.0
+Turbo level = the installed forced induction part (PartEnum 24-28: single / twin / quad turbo, centrifugal / positive displacement supercharger; the car's part table starts at Car+0x70E0 for enum 2). Intake air hiss: band-limited noise (1.5-7 kHz) on the engine-bay tracks, growing with throttle x revs and the forced induction level; Engine tab row "Intake air hiss (%)", 0-200, per car. Classic (non-granular) cars only.
