@@ -51,6 +51,7 @@ constexpr uintptr_t kSynthRead   = 0x1948A30;   // the read callback of the game
 constexpr uintptr_t kCreateDspDesc = 0x27BDF70; // FMOD::System::createDSP(sys, const FMOD_DSP_DESCRIPTION*, dsp**)
 constexpr uintptr_t kCreateDsp   = 0x27BE190;   // FMOD::System::createDSPByType(sys, type, dsp**)
 constexpr uintptr_t kAddDsp      = 0x27C1910;   // FMOD::ChannelControl::addDSP(cc, index, dsp)
+constexpr uintptr_t kDspRelease  = 0x27C5710;   // FMOD::DSP::release(dsp) (validates the handle: a stale one returns an error)
 constexpr uintptr_t kGetDsp      = 0x27C1C30;   // FMOD::ChannelControl::getDSP(cc, index, dsp**)
 constexpr uintptr_t kSetFloat    = 0x27C5F10;   // FMOD::DSP::setParameterFloat(dsp, index, value)
 constexpr uintptr_t kHud         = 0xB26690;    // HUD speedometer controller update: the player's Car at +0x120
@@ -62,7 +63,7 @@ struct Sig { uintptr_t rva; unsigned char b[6]; };
 const Sig kSigs[] = {
     {kCreateSound, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kStudioPlay, {0x48, 0x89, 0x5c, 0x24, 0x10, 0x48}},
     {kPlaySound, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kSynthRead, {0x4C, 0x8B, 0xDC, 0x57, 0x41, 0x54}}, {kCreateDspDesc, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}}, {kCreateDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},   {kAddDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},
-    {kGetDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},      {kSetFloat, {0x40, 0x53, 0x55, 0x56, 0x48, 0x81}},
+    {kDspRelease, {0x40, 0x57, 0x48, 0x81, 0xEC, 0x60}}, {kGetDsp, {0x40, 0x53, 0x55, 0x56, 0x57, 0x41}},      {kSetFloat, {0x40, 0x53, 0x55, 0x56, 0x48, 0x81}},
     {kHud, {0x40, 0x57, 0x48, 0x83, 0xec, 0x20}},
 };
 
@@ -71,6 +72,7 @@ typedef int (*StudioPlayFn)(void*, void*, void*, bool, int, void**);
 typedef int (*CreateDspFn)(void*, int, void**);
 typedef int (*AddDspFn)(void*, int, void*);
 typedef int (*GetDspFn)(void*, int, void**);
+typedef int (*ReleaseDspFn)(void*);
 typedef int (*SetFloatFn)(void*, int, float);
 typedef int (*SetCtlFloatFn)(void*, float);
 typedef uint64_t (*HudFn)(void*, void*, void*, void*);
@@ -136,6 +138,7 @@ std::atomic<int> g_bank_pg{-1}, g_bank_gs{-1};
 bool g_no_graph = false, g_no_own_dsp = false, g_no_echo = false;
 std::atomic<uint64_t> g_hud_tick{0}, g_busy_until{0};   // the HUD ticks every frame in the world, never on a loading screen
 std::atomic<long> g_grp_new{0}, g_grp_reuse{0};   // groups given an effect: new pointers / pointers seen before
+std::atomic<long> g_n_released{0};
 std::atomic<long> g_dc[5]{};   // diagnostics for the driven car: plays classified as other / exhaust / engine bay
 std::atomic<uint64_t> g_dnext{0};
 std::atomic<long> g_n_groups{0}, g_n_err{0};   // rows of kBankTier of the driven car's banks, -1 = not known
@@ -221,7 +224,7 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
         const uint64_t dn = g_dnext.load();
         if (dn && now > dn) {
             g_dnext = now + 60000;
-            say("sounds of the driven car so far: exhaust %ld, engine bay %ld, other %ld (tracks with effect: %ld = %ld new groups + %ld seen before); throttle %.2f, load %.2f, rev peak %.0f", g_dc[1].load(), g_dc[2].load(), g_dc[0].load(), g_n_groups.load(), g_grp_new.load(), g_grp_reuse.load(), g_thr.load(), g_load.load(), g_rpm_peak.load());
+            say("sounds of the driven car so far: exhaust %ld, engine bay %ld, other %ld (tracks with effect: %ld = %ld new groups + %ld seen before; %ld effects released); throttle %.2f, load %.2f, rev peak %.0f", g_dc[1].load(), g_dc[2].load(), g_dc[0].load(), g_n_groups.load(), g_grp_new.load(), g_grp_reuse.load(), g_n_released.load(), g_thr.load(), g_load.load(), g_rpm_peak.load());
         }
     }
     char* car = nullptr;
@@ -478,6 +481,39 @@ std::unordered_map<void*, Group> g_groups;   // track channel groups that carry 
 
 template <class F> F fn(uintptr_t rva) { return reinterpret_cast<F>(g_game + rva); }
 
+void release_group(Group& g) {   // the effect DSPs of a track that is gone (or whose group was reused): FMOD does not free what we created
+    void* all[5] = {g.eq, g.eq2, g.echo, g.dist, g.cdsp};
+    for (void* d : all)
+        if (d && fn<ReleaseDspFn>(kDspRelease)(d) == 0) g_n_released.fetch_add(1);
+    if (g.cst) g.cst->dead = true;
+    g = Group{};
+}
+// Once a second: a group whose handle FMOD no longer knows, or that no longer carries our EQ, is finished: release what we made for it.
+void sweep() {
+    static uint64_t next = 0;
+    const uint64_t now = GetTickCount64();
+    if (now < next) return;
+    next = now + 1000;
+    std::unique_lock gl{g_gmu, std::try_to_lock};
+    if (!gl.owns_lock() || g_groups.empty()) return;
+    std::vector<void*> dead;
+    for (auto& kv : g_groups) {
+        bool alive = false;
+        for (int i = 0; i < 8; ++i) {
+            void* d = nullptr;
+            if (fn<GetDspFn>(kGetDsp)(kv.first, i, &d) != 0) break;
+            if (d == kv.second.eq) { alive = true; break; }
+        }
+        if (!alive) dead.push_back(kv.first);
+    }
+    for (void* k : dead) {
+        release_group(g_groups[k]);
+        g_groups.erase(k);
+    }
+    static std::atomic<int> logged{0};
+    if (!dead.empty() && logged.fetch_add(1) < 3) say("effects of %zu finished tracks released (%zu tracks still carry one)", dead.size(), g_groups.size());
+}
+
 void apply(void* sys, void* grp, int cls, bool gran) {
     const int pv = g_preview.load();
     auto pick = [&](int exh) {
@@ -536,7 +572,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
     }
     if (!have) {
         (known ? g_grp_reuse : g_grp_new).fetch_add(1);
-        g = Group{};
+        release_group(g);
         if (nothing) return;   // stock: the group stays untouched
         void* eq = nullptr;
         int r = fn<CreateDspFn>(kCreateDsp)(sys, kDspThreeEq, &eq);
@@ -864,6 +900,7 @@ DWORD WINAPI worker(LPVOID) {
     for (;;) {
         Sleep(5);
         drain();
+        sweep();
         if (GetTickCount64() < next) continue;
         next += 4000;
         const long c = g_n_create.load(), p = g_n_play.load(), a = g_n_apply.load();
