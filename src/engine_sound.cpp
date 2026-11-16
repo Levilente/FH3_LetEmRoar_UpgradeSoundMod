@@ -224,7 +224,7 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
         const uint64_t dn = g_dnext.load();
         if (dn && now > dn) {
             g_dnext = now + 60000;
-            say("sounds of the driven car so far: exhaust %ld, engine bay %ld, other %ld (tracks with effect: %ld = %ld new groups + %ld seen before; %ld effects released); throttle %.2f, load %.2f, rev peak %.0f", g_dc[1].load(), g_dc[2].load(), g_dc[0].load(), g_n_groups.load(), g_grp_new.load(), g_grp_reuse.load(), g_n_released.load(), g_thr.load(), g_load.load(), g_rpm_peak.load());
+            say("sounds of the driven car so far: exhaust %ld, engine bay %ld, other %ld (tracks with effect: %ld = %ld new groups + %ld seen before; %ld effect sets re-used); throttle %.2f, load %.2f, rev peak %.0f", g_dc[1].load(), g_dc[2].load(), g_dc[0].load(), g_n_groups.load(), g_grp_new.load(), g_grp_reuse.load(), g_n_released.load(), g_thr.load(), g_load.load(), g_rpm_peak.load());
         }
     }
     char* car = nullptr;
@@ -475,44 +475,14 @@ void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) 
         }
 }
 
-struct Group { void* eq = nullptr; void* eq2 = nullptr; void* echo = nullptr; void* dist = nullptr; void* cdsp = nullptr; Dsp* cst = nullptr; unsigned serial = 0; };
+struct Group { void* eq = nullptr; void* eq2 = nullptr; void* echo = nullptr; void* dist = nullptr; void* cdsp = nullptr; Dsp* cst = nullptr; unsigned serial = 0; uint64_t last = 0; };
+// FMOD is never asked about a group that may be gone (a stale handle crashed it): the number of effect sets is kept down by re-using the
+// set of the least recently used track for a new one (addDSP moves a DSP that is already in another chain).
+constexpr size_t kMaxSets = 48;
 std::mutex g_gmu;
 std::unordered_map<void*, Group> g_groups;   // track channel groups that carry our effect
 
 template <class F> F fn(uintptr_t rva) { return reinterpret_cast<F>(g_game + rva); }
-
-void release_group(Group& g) {   // the effect DSPs of a track that is gone (or whose group was reused): FMOD does not free what we created
-    void* all[5] = {g.eq, g.eq2, g.echo, g.dist, g.cdsp};
-    for (void* d : all)
-        if (d && fn<ReleaseDspFn>(kDspRelease)(d) == 0) g_n_released.fetch_add(1);
-    if (g.cst) g.cst->dead = true;
-    g = Group{};
-}
-// Once a second: a group whose handle FMOD no longer knows, or that no longer carries our EQ, is finished: release what we made for it.
-void sweep() {
-    static uint64_t next = 0;
-    const uint64_t now = GetTickCount64();
-    if (now < next) return;
-    next = now + 1000;
-    std::unique_lock gl{g_gmu, std::try_to_lock};
-    if (!gl.owns_lock() || g_groups.empty()) return;
-    std::vector<void*> dead;
-    for (auto& kv : g_groups) {
-        bool alive = false;
-        for (int i = 0; i < 8; ++i) {
-            void* d = nullptr;
-            if (fn<GetDspFn>(kGetDsp)(kv.first, i, &d) != 0) break;
-            if (d == kv.second.eq) { alive = true; break; }
-        }
-        if (!alive) dead.push_back(kv.first);
-    }
-    for (void* k : dead) {
-        release_group(g_groups[k]);
-        g_groups.erase(k);
-    }
-    static std::atomic<int> logged{0};
-    if (!dead.empty() && logged.fetch_add(1) < 3) say("effects of %zu finished tracks released (%zu tracks still carry one)", dead.size(), g_groups.size());
-}
 
 void apply(void* sys, void* grp, int cls, bool gran) {
     const int pv = g_preview.load();
@@ -572,22 +542,47 @@ void apply(void* sys, void* grp, int cls, bool gran) {
     }
     if (!have) {
         (known ? g_grp_reuse : g_grp_new).fetch_add(1);
-        release_group(g);
-        if (nothing) return;   // stock: the group stays untouched
-        void* eq = nullptr;
-        int r = fn<CreateDspFn>(kCreateDsp)(sys, kDspThreeEq, &eq);
-        if (r == 0 && eq) r = fn<AddDspFn>(kAddDsp)(grp, 0, eq);
-        if (r != 0 || !eq) {
-            if (g_n_err.fetch_add(1) < 5) say("FMOD would not add the EQ to a track (error %d)", r);
-            return;
+        if (nothing) { if (!g.eq) g_groups.erase(grp); return; }   // stock: the group stays untouched
+        const uint64_t now = GetTickCount64();
+        Group set = g;
+        g = Group{};
+        if (!set.eq && g_groups.size() > kMaxSets) {   // too many sets: take the one of the track that played longest ago
+            void* vk = nullptr;
+            uint64_t vl = now;
+            for (auto& kv : g_groups)
+                if (kv.first != grp && kv.second.eq && kv.second.last < vl && now - kv.second.last > 3000) { vl = kv.second.last; vk = kv.first; }
+            if (vk) { set = g_groups[vk]; g_groups.erase(vk); }
         }
-        g.eq = eq;
-        void* eq2 = nullptr;
-        if (fn<CreateDspFn>(kCreateDsp)(sys, kDspThreeEq, &eq2) == 0 && eq2 && fn<AddDspFn>(kAddDsp)(grp, 0, eq2) == 0) g.eq2 = eq2;
+        if (set.eq) {   // re-use the effects: they move to this group
+            if (fn<AddDspFn>(kAddDsp)(grp, 0, set.eq) == 0) {
+                g = set;
+                if (g.eq2 && fn<AddDspFn>(kAddDsp)(grp, 0, g.eq2) != 0) g.eq2 = nullptr;
+                if (g.echo && fn<AddDspFn>(kAddDsp)(grp, 0, g.echo) != 0) g.echo = nullptr;
+                if (g.dist && fn<AddDspFn>(kAddDsp)(grp, 0, g.dist) != 0) g.dist = nullptr;
+                if (g.cdsp && fn<AddDspFn>(kAddDsp)(grp, 0, g.cdsp) != 0) { g.cdsp = nullptr; g.cst = nullptr; }
+                g.serial = 0;
+                g_n_released.fetch_add(1);
+            }
+        }
+        if (!g.eq) {
+            void* eq = nullptr;
+            int r = fn<CreateDspFn>(kCreateDsp)(sys, kDspThreeEq, &eq);
+            if (r == 0 && eq) r = fn<AddDspFn>(kAddDsp)(grp, 0, eq);
+            if (r != 0 || !eq) {
+                if (g_n_err.fetch_add(1) < 5) say("FMOD would not add the EQ to a track (error %d)", r);
+                return;
+            }
+            g.eq = eq;
+            void* eq2 = nullptr;
+            if (fn<CreateDspFn>(kCreateDsp)(sys, kDspThreeEq, &eq2) == 0 && eq2 && fn<AddDspFn>(kAddDsp)(grp, 0, eq2) == 0) g.eq2 = eq2;
+        }
         const long n = g_n_groups.fetch_add(1) + 1;
         if (n <= 3 || n == 10 || n == 50) say("effect on %ld track(s) so far (this one: %s, level %d)", n, cls == 1 ? "exhaust" : (cls == 3 ? "granular synth" : "engine bay / intake"), tier);
-    } else if (g.serial == serial)
+    } else if (g.serial == serial) {
+        g.last = GetTickCount64();
         return;
+    }
+    g.last = GetTickCount64();
     g.serial = serial;
     const SetFloatFn setf = fn<SetFloatFn>(kSetFloat);
     setf(g.eq, 3, fx.x1);   // low/mid crossover
@@ -900,7 +895,6 @@ DWORD WINAPI worker(LPVOID) {
     for (;;) {
         Sleep(5);
         drain();
-        sweep();
         if (GetTickCount64() < next) continue;
         next += 4000;
         const long c = g_n_create.load(), p = g_n_play.load(), a = g_n_apply.load();
