@@ -630,11 +630,12 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
         (void)kTv; (void)kBv; (void)t;
         if (kd == 5) {   // 100% = the game's own level; 200% about 3x; the game's own loudness curve stays
             const float b = g_boost.load();
-            vl = std::pow(g_tur_amount.load(), 2.6f) * (0.05f + 0.95f * b);   // 200% = about 6x at full boost
-        } else if (kd == 6) vl = std::pow(g_bov_amount.load(), 2.6f);
-        vl = vl < 0 ? 0 : (vl > 8.0f ? 8.0f : vl);
+            vl = 6.0f * std::pow(g_tur_amount.load(), 1.6f) * (0.15f + 0.85f * std::pow(b, 0.6f));   // 100% = 6x at full boost, 200% = 18x
+        } else if (kd == 6) vl = 3.0f * std::pow(g_bov_amount.load(), 1.6f);
+        vl = vl < 0 ? 0 : (vl > 20.0f ? 20.0f : vl);
     }
     const float tb = ftanh(bias);
+    const float lim = d->kind.load() >= 5 ? 9.0f : 0.8f;   // turbo / blow-off layers: no soft limiter (a loud setting must stay louder)
     const float airg = d->air.load() ? g_air.load() * 0.5f : 0.0f;
     const float wamp = d->air.load() ? g_whl_amp.load() : 0.0f;
     const float wfreq = g_whl_freq.load();
@@ -661,7 +662,7 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
             d->wl[c] += 0.45f * (wet - d->wl[c]);   // the added rasp is smoothed above ~7 kHz: ragged, not fizzy
             float o = (y + mix * d->wl[c]) * gain * vl;
             const float ao = o < 0 ? -o : o;
-            if (ao > 0.8f) o = (o < 0 ? -1.0f : 1.0f) * (0.8f + 0.2f * ftanh((ao - 0.8f) / 0.2f));
+            if (lim < 1.5f && ao > lim) o = (o < 0 ? -1.0f : 1.0f) * (lim + (1.0f - lim) * ftanh((ao - lim) / (1.0f - lim)));
             if (airg > 0) {
                 d->rng ^= d->rng << 13; d->rng ^= d->rng >> 17; d->rng ^= d->rng << 5;
                 const float nz = static_cast<float>(d->rng & 0xFFFF) / 32768.0f - 1.0f;
