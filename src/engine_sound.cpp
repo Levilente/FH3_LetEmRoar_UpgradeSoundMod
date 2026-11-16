@@ -622,8 +622,11 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
     {   // the turbo / blow-off volume follows the slider live (a looping sound is set up only once)
         static const float kTv[4] = {1.0f, 1.3f, 1.7f, 2.2f}, kBv[4] = {1.0f, 1.2f, 1.5f, 1.9f};
         const int kd = d->kind.load(), t = g_tur_tier.load() & 3;
-        if (kd == 5) vl = g_tur_amount.load() * kTv[t];
-        else if (kd == 6) vl = g_bov_amount.load() * kBv[t];
+        (void)kTv; (void)kBv; (void)t;
+        if (kd == 5) {   // 100% = the game's own level; 200% about 3x; the turbo's loudness also follows the boost pressure
+            const float b = g_boost.load();
+            vl = std::pow(g_tur_amount.load(), 1.6f) * (0.3f + 0.7f * std::pow(b, 0.8f));
+        } else if (kd == 6) vl = std::pow(g_bov_amount.load(), 1.6f);
         vl = vl < 0 ? 0 : (vl > 4.0f ? 4.0f : vl);
     }
     const float tb = ftanh(bias);
@@ -761,12 +764,13 @@ void apply(void* sys, void* grp, int cls, bool gran) {
         static const float kTv[4] = {1.0f, 1.3f, 1.7f, 2.2f}, kBv[4] = {1.0f, 1.2f, 1.5f, 1.9f};
         if (cls == 5) {
             const float ta = g_tur_amount.load();
-            fx = kTurFx[tier];
-            fx.low *= ta; fx.mid *= ta; fx.high *= ta; fx.band *= ta;
-            vol = ta * kTv[tier];
+            (void)ta; (void)kTv;
+            fx = kTurFx[0];   // no tone change: 100% sounds like the game's own turbo
+            vol = 1.0f;
         } else {
             fx = kTurFx[0];
-            vol = g_bov_amount.load() * kBv[tier];
+            (void)kBv;
+            vol = 1.0f;
         }
         fx.echo_wet = -80;
         vol = vol < 0 ? 0 : (vol > 4.0f ? 4.0f : vol);

@@ -62,3 +62,6 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 - The synthesised whistle is switched off: the turbo/supercharger sound is the game's own for the fitted part.
 - Turbo and blow-off volume now follow the sliders live (before, a looping sound only picked the volume up when it started).
 - Log: "turbo sample played" / "turbo track set up" lines for diagnosis.
+
+### 1.11.4
+- Turbo/blow-off: no tone change any more (100% = the game's own level), volume 200% about 3x; the turbo's loudness follows the boost pressure.
