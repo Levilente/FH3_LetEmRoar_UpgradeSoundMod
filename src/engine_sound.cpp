@@ -129,49 +129,59 @@ void on_slide(void*, const char* key, float value) {
 }
 
 std::atomic<int> g_exh_tier{0}, g_int_tier{0};
-// ---- the sound type chosen per car (Tune Car > Engine) --------------------------------------------------------------------
+// ---- the Engine tab's settings, saved per car -------------------------------------------------------------------------------
+struct CarCfg { int e = 0, i = 0, ea = 100, ia = 100, rasp = 25, pipe = 100, pops = 100; };   // sound types (0 = as installed), then percents
+CarCfg g_def;   // what a car without its own entry gets (the old global ini values)
 std::mutex g_selmu;
-std::unordered_map<uint32_t, std::pair<int, int>> g_sel;   // garage id -> {exhaust, intake} choice, 0 = as installed
-uint32_t g_sel_garage = 0;
-void sel_refresh(uint32_t garage) {
-    std::pair<int, int> v{0, 0};
-    {
-        std::lock_guard<std::mutex> l(g_selmu);
-        auto it = g_sel.find(garage);
-        if (it != g_sel.end()) v = it->second;
-        g_sel_garage = garage;
-    }
-    if (g_ov_exh.exchange(v.first) != v.first || g_ov_int.exchange(v.second) != v.second) g_cfg_serial.fetch_add(1);
+std::unordered_map<uint32_t, CarCfg> g_sel;   // garage id -> its settings
+uint32_t cur_garage() { return g_api && g_api->upgrade_active_garage ? g_api->upgrade_active_garage() : 0; }
+CarCfg cfg_of(uint32_t garage) {
+    std::lock_guard<std::mutex> l(g_selmu);
+    auto it = g_sel.find(garage);
+    return it == g_sel.end() ? g_def : it->second;
 }
+void cfg_apply(const CarCfg& c) {   // make it the settings in force (the driven car's)
+    const bool ch = g_ov_exh.exchange(c.e) != c.e | g_ov_int.exchange(c.i) != c.i;
+    g_exh_amount = c.ea / 100.0f; g_int_amount = c.ia / 100.0f; g_rasp = c.rasp / 100.0f; g_pipe = c.pipe / 100.0f; g_pops = c.pops / 100.0f;
+    if (ch) g_cfg_serial.fetch_add(1);
+}
+void sel_refresh(uint32_t garage) { cfg_apply(cfg_of(garage)); g_cfg_serial.fetch_add(1); }
 void sel_load() {
     wchar_t buf[8192] = {};
     GetPrivateProfileSectionW(L"Cars", buf, 8192, g_ini);
     for (const wchar_t* q = buf; *q; q += wcslen(q) + 1) {
-        unsigned id = 0; int e = 0, i = 0;
-        if (swscanf(q, L"%u=%d,%d", &id, &e, &i) == 3 && id && e >= 0 && e <= 4 && i >= 0 && i <= 4) g_sel[id] = {e, i};
+        unsigned id = 0;
+        CarCfg c = g_def;
+        const int n = swscanf(q, L"%u=%d,%d,%d,%d,%d,%d,%d", &id, &c.e, &c.i, &c.ea, &c.ia, &c.rasp, &c.pipe, &c.pops);
+        if (n < 3 || !id) continue;
+        auto cl = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+        c.e = cl(c.e, 0, 4); c.i = cl(c.i, 0, 4); c.ea = cl(c.ea, 0, 200); c.ia = cl(c.ia, 0, 200); c.rasp = cl(c.rasp, 0, 35); c.pipe = cl(c.pipe, 0, 200); c.pops = cl(c.pops, 0, 200);
+        g_sel[id] = c;
     }
 }
-void sel_set(int exh, int v) {
-    const uint32_t id = g_api && g_api->upgrade_active_garage ? g_api->upgrade_active_garage() : 0;
+// field: 0 exhaust type, 1 intake type, 2 exhaust %, 3 intake %, 4 rasp, 5 pipe, 6 pops
+void sel_set(int field, int v) {
+    const uint32_t id = cur_garage();
     if (!id) return;
-    std::pair<int, int> cur;
+    CarCfg c;
     {
         std::lock_guard<std::mutex> l(g_selmu);
-        auto& e = g_sel[id];
-        (exh ? e.first : e.second) = v;
-        cur = e;
+        auto it = g_sel.find(id);
+        c = it == g_sel.end() ? g_def : it->second;
+        int* f[7] = {&c.e, &c.i, &c.ea, &c.ia, &c.rasp, &c.pipe, &c.pops};
+        *f[field] = v;
+        g_sel[id] = c;
     }
-    wchar_t k[16], t[16];
+    wchar_t k[16], t[96];
     _snwprintf(k, 16, L"%u", id);
-    _snwprintf(t, 16, L"%d,%d", cur.first, cur.second);
-    WritePrivateProfileStringW(L"Cars", k, (cur.first || cur.second) ? t : nullptr, g_ini);
+    _snwprintf(t, 96, L"%d,%d,%d,%d,%d,%d,%d", c.e, c.i, c.ea, c.ia, c.rasp, c.pipe, c.pops);
+    WritePrivateProfileStringW(L"Cars", k, t, g_ini);
     sel_refresh(id);
 }
-float sel_get(int exh) {
-    const uint32_t id = g_api && g_api->upgrade_active_garage ? g_api->upgrade_active_garage() : 0;
-    std::lock_guard<std::mutex> l(g_selmu);
-    auto it = g_sel.find(id);
-    return it == g_sel.end() ? 0.0f : static_cast<float>(exh ? it->second.first : it->second.second);
+float sel_get(int field) {
+    const CarCfg c = cfg_of(cur_garage());
+    const int f[7] = {c.e, c.i, c.ea, c.ia, c.rasp, c.pipe, c.pops};
+    return static_cast<float>(f[field]);
 }
 // the tier to use for the driven car's exhaust (exh) or intake
 int eff_tier(int exh) {
@@ -975,8 +985,10 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_int_amount = static_cast<float>(ini_int(L"IntakeAmount", 100)) / 100.0f;
     g_rasp       = static_cast<float>(std::min(35, std::max(0, ini_int(L"Rasp", 25)))) / 100.0f;
     g_pipe       = static_cast<float>(std::min(200, std::max(0, ini_int(L"PipeAmount", ini_int(L"Pipe", 1) ? 100 : 0)))) / 100.0f;
+    g_def.ea = ini_int(L"ExhaustAmount", 100); g_def.ia = ini_int(L"IntakeAmount", 100); g_def.rasp = std::min(35, std::max(0, ini_int(L"Rasp", 25)));
+    g_def.pipe = std::min(200, std::max(0, ini_int(L"PipeAmount", ini_int(L"Pipe", 1) ? 100 : 0))); g_def.pops = ini_int(L"Pops", 100);
     sel_load();
-    g_pops       = static_cast<float>(ini_int(L"Pops", 100)) / 100.0f;
+    cfg_apply(g_def);
 
     FH3Setting s{};
     s.size = sizeof s;
@@ -990,25 +1002,25 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
         static const FH3TuningRow rows[] = {
             {sizeof(FH3TuningRow), "SndExh", "Engine sound|Exhaust sound type (0-4)",
              "0 = as installed on the car (default), 1 = Stock, 2 = Street, 3 = Sport, 4 = Race. Forces that exhaust sound on this car, e.g. a loud one on a weak car. Heard after the car's sound is loaded again (drive off, or switch cars).",
-             0, 4, 1, 0, [](void*) { return sel_get(1); }, [](void*, float v) { sel_set(1, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
+             0, 4, 1, 0, [](void*) { return sel_get(0); }, [](void*, float v) { sel_set(0, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "SndInt", "Engine sound|Intake sound type (0-4)",
              "0 = as installed on the car (default), 1 = Stock, 2 = Street, 3 = Sport, 4 = Race. Forces that intake sound on this car. Heard after the car's sound is loaded again.",
-             0, 4, 1, 0, [](void*) { return sel_get(0); }, [](void*, float v) { sel_set(0, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
+             0, 4, 1, 0, [](void*) { return sel_get(1); }, [](void*, float v) { sel_set(1, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "ExhaustAmount", "Engine sound|Exhaust intensity (%)",
              "How strongly the exhaust level changes the sound. 100 is the mod's own setting, 0 is none, 200 is double.",
-             0, 200, 5, 0, [](void*) { return g_exh_amount.load() * 100.0f; }, [](void*, float v) { on_slide(nullptr, "ExhaustAmount", v); }, nullptr, nullptr, "Engine"},
+             0, 200, 5, 0, [](void*) { return sel_get(2); }, [](void*, float v) { sel_set(2, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "IntakeAmount", "Engine sound|Intake intensity (%)",
              "How strongly the intake level changes the sound. 100 is the mod's own setting, 0 is none, 200 is double.",
-             0, 200, 5, 0, [](void*) { return g_int_amount.load() * 100.0f; }, [](void*, float v) { on_slide(nullptr, "IntakeAmount", v); }, nullptr, nullptr, "Engine"},
+             0, 200, 5, 0, [](void*) { return sel_get(3); }, [](void*, float v) { sel_set(3, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "Rasp", "Engine sound|Rasp / grit (%)",
              "How much grit the higher levels add on top of the open, bright tone. 0 is clean, 35 is the most. It follows throttle and revs.",
-             0, 35, 1, 0, [](void*) { return g_rasp.load() * 100.0f; }, [](void*, float v) { on_slide(nullptr, "Rasp", v); }, nullptr, nullptr, "Engine"},
+             0, 35, 1, 0, [](void*) { return sel_get(4); }, [](void*, float v) { sel_set(4, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "PipeAmount", "Engine sound|Pipe resonance (%)",
              "The hollow ring of a freer exhaust pipe on the Sport and Race exhaust. 0 is none, 100 is the mod's own, 200 is double.",
-             0, 200, 5, 0, [](void*) { return g_pipe.load() * 100.0f; }, [](void*, float v) { on_slide(nullptr, "PipeAmount", v); }, nullptr, nullptr, "Engine"},
+             0, 200, 5, 0, [](void*) { return sel_get(5); }, [](void*, float v) { sel_set(5, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "Pops", "Engine sound|Extra exhaust pops (%)",
              "How much more the exhaust pops and crackles on a lift with better exhaust parts. 0 is none, 200 is double.",
-             0, 200, 5, 0, [](void*) { return g_pops.load() * 100.0f; }, [](void*, float v) { on_slide(nullptr, "Pops", v); }, nullptr, nullptr, "Engine"},
+             0, 200, 5, 0, [](void*) { return sel_get(6); }, [](void*, float v) { sel_set(6, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
         };
         for (const FH3TuningRow& r : rows) api->add_tuning_row(g_mod, &r);
     } else {
