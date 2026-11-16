@@ -616,7 +616,7 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
         const unsigned n = length * static_cast<unsigned>(inch);
         float mx = 0;
         for (unsigned i = 0; i < n; ++i) { const float a = in[i] < 0 ? -in[i] : in[i]; mx = a > mx ? a : mx; }
-        if (mx < 1e-5f) { if (in != out) memcpy(out, in, sizeof(float) * n); return 0; }
+        if (mx < 1e-5f && !(d->air.load() && g_air.load() > 0.002f)) { if (in != out) memcpy(out, in, sizeof(float) * n); return 0; }   // (the hiss goes on over a silent intake)
     }
     static const float af = 1.0f - std::exp(-1.0f / (0.0007f * kSr)), rf = 1.0f - std::exp(-1.0f / (0.012f * kSr)),
                        as = 1.0f - std::exp(-1.0f / (0.030f * kSr)), rs = 1.0f - std::exp(-1.0f / (0.060f * kSr)),

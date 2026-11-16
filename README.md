@@ -75,3 +75,6 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 
 ### 1.11.7
 - Boost follow-up made much clearer: dead zone near idle pressure, steeper curve, faster response; hiss and turbo volume use it directly.
+
+### 1.11.8
+- The air hiss keeps going while the boost pressure is held even if the intake track itself falls silent on a lift.

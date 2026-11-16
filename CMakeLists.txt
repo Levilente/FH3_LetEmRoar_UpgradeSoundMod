@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(fh3_engine_sound VERSION 1.11.7 LANGUAGES C CXX)
+project(fh3_engine_sound VERSION 1.11.8 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
