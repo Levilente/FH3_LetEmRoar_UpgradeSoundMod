@@ -45,3 +45,6 @@ Turbo layers: much stronger lift (+4.5 / +7 / +10 dB at Race), the 60 s diagnost
 
 ## 1.10.0
 Turbo level = the installed forced induction part (PartEnum 24-28: single / twin / quad turbo, centrifugal / positive displacement supercharger; the car's part table starts at Car+0x70E0 for enum 2). Intake air hiss: band-limited noise (1.5-7 kHz) on the engine-bay tracks, growing with throttle x revs and the forced induction level; Engine tab row "Intake air hiss (%)", 0-200, per car. Classic (non-granular) cars only.
+
+## 1.11.0
+The turbo layers are split in two: spool / whistle / whine (events with Boost + EngineRPM) and the short blow-off / flutter one-shots (Boost only). Engine tab, per car: Turbo / supercharger volume (%), Blow-off valve volume (%, 0 = off), Blow-off valve sound (0-15: always the same one of the car's blow-off samples), Intake air hiss (%, turbos only, louder now). Volume is a plain gain inside our own effect, so it works on every level.
