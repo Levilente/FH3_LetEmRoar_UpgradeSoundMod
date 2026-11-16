@@ -57,3 +57,8 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 - Own synthesised turbo whistle (rises with boost, per level) and supercharger whine (rises with revs), controlled by the turbo/supercharger volume slider; they no longer depend on the game's turbo samples.
 - Air hiss follows boost pressure, also on factory turbos (quiet at stock, stronger per level); boost range is learned from the car.
 - Log line "boost ..." every 5 s while boosting.
+
+### 1.11.3
+- The synthesised whistle is switched off: the turbo/supercharger sound is the game's own for the fitted part.
+- Turbo and blow-off volume now follow the sliders live (before, a looping sound only picked the volume up when it started).
+- Log: "turbo sample played" / "turbo track set up" lines for diagnosis.

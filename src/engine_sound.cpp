@@ -376,11 +376,11 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
                     const float b = g_boost.load();
                     if (g_fi_turbo.load()) {
                         g_air = kLv[tr] * en * g_air_amount.load() * std::pow(b, 1.1f);
-                        g_whl_amp = kWh[tr] * en * g_tur_amount.load() * std::pow(b, 1.4f);
+                        g_whl_amp = 0;
                         g_whl_freq = 2200.0f + 5200.0f * b;
                     } else if (g_fi_sc.load()) {
                         g_air = 0;
-                        g_whl_amp = kWh[tr] * 0.8f * en * g_tur_amount.load() * (0.15f + 0.85f * g_load.load()) * (0.3f + 0.7f * rn);
+                        g_whl_amp = 0;
                         g_whl_freq = 900.0f + 3600.0f * rn;
                     } else { g_air = 0; g_whl_amp = 0; }
                     static std::atomic<uint64_t> tnext{0};
@@ -586,7 +586,7 @@ inline float ftanh(float x) {
     const float x2 = x * x;
     return x * (27.0f + x2) / (27.0f + 9.0f * x2);
 }
-struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}, floor{0.4f}, vol{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}, nl[8] = {}, nh[8] = {}; uint32_t rng = 0x2545F491u; float ph = 0, ph2 = 0; std::atomic<bool> air{false}, dead{false}; };
+struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}, floor{0.4f}, vol{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}, nl[8] = {}, nh[8] = {}; uint32_t rng = 0x2545F491u; float ph = 0, ph2 = 0; std::atomic<bool> air{false}, dead{false}; std::atomic<int> kind{0}; };
 thread_local Dsp* t_new_dsp = nullptr;
 constexpr float kSr = 48000.0f;
 
@@ -618,7 +618,14 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
                        al = 1.0f - std::exp(-6.2831853f * 700.0f / kSr);
     const float fl = d->floor.load(), dyn = fl + (1.0f - fl) * g_load.load();   // rawer under load, cleaner on a lift
     const float k = d->k.load() * dyn, drive = d->drive.load(), mix = d->mix.load() * dyn, bias = d->bias.load(), gain = 1.0f + (d->gain.load() - 1.0f) * dyn;
-    const float vl = d->vol.load();
+    float vl = d->vol.load();
+    {   // the turbo / blow-off volume follows the slider live (a looping sound is set up only once)
+        static const float kTv[4] = {1.0f, 1.3f, 1.7f, 2.2f}, kBv[4] = {1.0f, 1.2f, 1.5f, 1.9f};
+        const int kd = d->kind.load(), t = g_tur_tier.load() & 3;
+        if (kd == 5) vl = g_tur_amount.load() * kTv[t];
+        else if (kd == 6) vl = g_bov_amount.load() * kBv[t];
+        vl = vl < 0 ? 0 : (vl > 4.0f ? 4.0f : vl);
+    }
     const float tb = ftanh(bias);
     const float airg = d->air.load() ? g_air.load() * 0.5f : 0.0f;
     const float wamp = d->air.load() ? g_whl_amp.load() : 0.0f;
@@ -882,6 +889,8 @@ void apply(void* sys, void* grp, int cls, bool gran) {
     if (g.cst && !g.cst->dead.load()) {
         g.cst->floor = cls == 2 ? 0.8f : (cls >= 5 ? 1.0f : 0.7f);
         g.cst->vol = vol;
+        g.cst->kind = (cls == 5 || cls == 6) ? cls : 0;
+        { static std::atomic<int> lg{0}; if ((cls == 5 || cls == 6) && lg.fetch_add(1) < 12) say("%s track set up: volume %.2f (turbo level %d, own effect %s)", cls == 5 ? "turbo" : "blow-off", vol, tier, g.cst ? "on" : "off"); }
         g.cst->air = air_wanted;
         g.cst->k = dp.k; g.cst->drive = dp.drive; g.cst->mix = dp.mix; g.cst->bias = dp.bias;
         g.cst->gain = std::pow(10.0f, dp.gain_db / 20.0f);
@@ -1002,6 +1011,7 @@ int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch)
         cls = classify(snd, &row);
     }
     if (row >= 0 && (row == g_bank_pg.load() || row == g_bank_gs.load())) g_dc[cls].fetch_add(1);
+    if (cls == 5 || cls == 6) { static std::atomic<int> lp{0}; if (lp.fetch_add(1) < 12) say("%s sample played (row %d)", cls == 5 ? "turbo" : "blow-off", row); }
     if (!cls) return r;
     if (!g_all_cars.load()) {
         const int pg = g_bank_pg.load(), gs = g_bank_gs.load();
