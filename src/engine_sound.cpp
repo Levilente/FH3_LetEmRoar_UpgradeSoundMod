@@ -623,9 +623,10 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
         static const float kTv[4] = {1.0f, 1.3f, 1.7f, 2.2f}, kBv[4] = {1.0f, 1.2f, 1.5f, 1.9f};
         const int kd = d->kind.load(), t = g_tur_tier.load() & 3;
         (void)kTv; (void)kBv; (void)t;
-        if (kd == 5) {   // 100% = the game's own level; 200% about 3x; the turbo's loudness also follows the boost pressure
+        if (kd == 5) {   // 100% = the game's own level; 200% about 3x; the game's own loudness curve stays
             const float b = g_boost.load();
-            vl = std::pow(g_tur_amount.load(), 1.6f) * (0.3f + 0.7f * std::pow(b, 0.8f));
+            (void)b;
+            vl = std::pow(g_tur_amount.load(), 1.6f);
         } else if (kd == 6) vl = std::pow(g_bov_amount.load(), 1.6f);
         vl = vl < 0 ? 0 : (vl > 4.0f ? 4.0f : vl);
     }

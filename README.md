@@ -65,3 +65,6 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 
 ### 1.11.4
 - Turbo/blow-off: no tone change any more (100% = the game's own level), volume 200% about 3x; the turbo's loudness follows the boost pressure.
+
+### 1.11.5
+- The turbo's loudness no longer follows boost pressure (the game's own curve only); the slider scales it.
