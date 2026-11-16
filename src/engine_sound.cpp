@@ -462,13 +462,13 @@ struct Fx {
     float echo_ms, echo_wet, echo_fb;   // pipe resonance: delay, wet level in dB (<= -80: none), feedback %
     float dist;                     // distortion level (scaled by the Rasp slider)
 };
-// Turbo / boost layers (spool, whistle, flutter): the tilt EQ's top part opens up, a band around the whistle, and a long soft echo makes them float.
+// Turbo / boost layers (spool, whistle, flutter): airy, not echoing: the top end opens up (breath, hiss, whistle) with the level, no delay.
 // Levels follow the forced induction upgrade. Fields: low, mid, high, x1, x2, band, b1, b2, echo_ms, echo_wet, echo_fb, dist.
 const Fx kTurFx[4] = {
-    {0, 0, 0, 1200, 3000, 0, 3000, 8000, 60, -80, 0, 0},
-    {0, 1.5f, 3.0f, 1200, 3000, 1.5f, 3000, 8000, 55, -22, 25, 0},
-    {0, 2.5f, 5.0f, 1200, 3000, 2.5f, 3000, 8000, 70, -17, 35, 0},
-    {0, 3.5f, 7.0f, 1200, 3000, 3.5f, 3000, 8000, 85, -13, 45, 0}};
+    {0, 0, 0, 1500, 5000, 0, 5000, 11000, 60, -80, 0, 0},
+    {0, 1.0f, 3.5f, 1500, 5000, 1.5f, 5000, 11000, 60, -80, 0, 0},
+    {0, 1.5f, 6.0f, 1500, 5000, 3.0f, 5000, 11000, 60, -80, 0, 0},
+    {0, 2.0f, 8.0f, 1500, 5000, 4.5f, 5000, 11000, 60, -80, 0, 0}};
 // Exhaust: stock; sport rear muffler; sport rear + middle muffler; open straight-through system.
 const Fx kExhFx[4] = {
     {0, 0, 0, 250, 2500, 0, 700, 1800, 12, -80, 0, 0},
@@ -1102,7 +1102,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
              "The hollow ring of a freer exhaust pipe on the Sport and Race exhaust. 0 is none, 100 is the mod's own, 200 is double.",
              0, 200, 5, 0, [](void*) { return sel_get(5); }, [](void*, float v) { sel_set(5, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "TurboAmount", "Engine sound|Turbo / boost sound (%)",
-             "Spool, whistle and flutter of the turbo: louder, brighter and floatier with a better turbo. 0 is none, 100 is the mod's own, 200 is double.",
+             "Spool, whistle and flutter of the turbo: louder, brighter and airier with a better turbo. 0 is none, 100 is the mod's own, 200 is double.",
              0, 200, 5, 0, [](void*) { return sel_get(7); }, [](void*, float v) { sel_set(7, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "Pops", "Engine sound|Extra exhaust pops (%)",
              "How much more the exhaust pops and crackles on a lift with better exhaust parts. 0 is none, 200 is double.",

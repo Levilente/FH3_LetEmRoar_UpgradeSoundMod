@@ -36,3 +36,6 @@ Load timing: after every loading screen (HUD silent for over 3 s) one log line s
 
 ## 1.9.0: turbo / boost sounds
 The turbo layers (spool, whistle, flutter: the samples of the sub-events driven by the Boost parameter) are recognised separately (bank_tiers.inc has a third mask; tools/tiers_table.py generates it) and get their own effect per level: brighter, louder, with a soft long echo so they float. Engine tab: "Turbo / boost sound (%)" 0-200, per car. The level follows the higher of intake / exhaust for now; the log line "car part ids from Car+0x70E0" is for finding the forced induction slot.
+
+## 1.9.1
+Turbo / boost layers: airier instead of echoing (the top end opens with the level, no delay).
