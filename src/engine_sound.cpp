@@ -365,11 +365,20 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
                     const float en = g_enabled.load() ? 1.0f : 0.0f;
                     float bn = 0.0f;
                     float bv = 0, bmin = 0;
+                    static float f_bv = -1, f_om = -1;
+                    static uint64_t f_t = 0;
+                    {   // the physics stands still (a menu, a pause): the boost reading is frozen, so it counts as none
+                        float b2 = 0;
+                        const uint64_t tn2 = GetTickCount64();
+                        if (!rd(dyn + 0x620, &b2, 4) || b2 != f_bv || omega != f_om) { f_bv = b2; f_om = omega; f_t = tn2; }
+                        if (tn2 - f_t > 350) bv = -1e9f;
+                    }
                     static float bpk = 0, bmn = 1e9f;
                     static float last_pk = 1e9f;
                     if (g_rpm_peak.load() < last_pk) { bpk = 0; bmn = 1e9f; }   // a new car: the rev peak starts again
                     last_pk = g_rpm_peak.load();
-                    if (rd(dyn + 0x620, &bv, 4) && bv == bv && bv > -1000 && bv < 1000) {
+                    const bool frozen = bv < -1e8f;
+                    if (!frozen && rd(dyn + 0x620, &bv, 4) && bv == bv && bv > -1000 && bv < 1000) {
                         if (bv < bmn) bmn = bv;
                         if (bv > bpk) bpk = bv;
                         const float span = bpk - bmn;
@@ -636,7 +645,8 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
     }
     const float tb = ftanh(bias);
     const float lim = d->kind.load() >= 5 ? 9.0f : 0.8f;   // turbo / blow-off layers: no soft limiter (a loud setting must stay louder)
-    const float airg = d->air.load() ? g_air.load() * 0.5f : 0.0f;
+    const bool live = GetTickCount64() - g_hud_tick.load() < 400;   // no HUD frames: a menu or a pause, no hiss
+    const float airg = d->air.load() && live ? g_air.load() * 0.5f : 0.0f;
     const float wamp = d->air.load() ? g_whl_amp.load() : 0.0f;
     const float wfreq = g_whl_freq.load();
     const float wstep = 6.2831853f * wfreq / kSr;   // intake air hiss: band-limited noise, 1.5 .. 7 kHz
@@ -720,7 +730,7 @@ void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) 
                        al = 1.0f - std::exp(-6.2831853f * 700.0f / kSr);
     const float a1 = 1.0f - std::exp(-6.2831853f * b.x1 / kSr), a2 = 1.0f - std::exp(-6.2831853f * b.x2 / kSr), tb = ftanh(b.bias);
     Dsp& d = in.d;
-    const float airg = (g_fi_turbo.load() && g_enabled.load()) ? g_air.load() * 0.5f : 0.0f;   // the intake air hiss of a turbo car (a granular engine has one track: it goes in here)
+    const float airg = (g_fi_turbo.load() && g_enabled.load() && GetTickCount64() - g_hud_tick.load() < 400) ? g_air.load() * 0.5f : 0.0f;   // the intake air hiss of a turbo car (a granular engine has one track: it goes in here)
     static const float nlp = 1.0f - std::exp(-6.2831853f * 7000.0f / kSr), nhp = 1.0f - std::exp(-6.2831853f * 1500.0f / kSr);
     for (unsigned i = 0; i < frames; ++i)
         for (int c = 0; c < ch; ++c) {

@@ -87,3 +87,6 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 
 ### 1.11.11
 - Granular engines with stock exhaust and intake (types 0/0 / stock parts) skipped the whole effect, hiss included: the hiss now still runs there.
+
+### 1.11.12
+- No hiss in the tuning menu / pause: frozen physics readings count as no boost, and no HUD frames silence the hiss.
