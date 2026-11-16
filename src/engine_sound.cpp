@@ -106,6 +106,8 @@ std::atomic<float> g_pipe{1.0f};        // pipe resonance amount 0 .. 2 (short e
 std::atomic<float> g_air_amount{1.0f}, g_air{0.0f}, g_boost{0.0f};   // intake air hiss: the car's amount 0 .. 2, and the level in force (follows throttle and revs)
 std::atomic<float> g_tur_amount{1.0f}, g_bov_amount{1.0f};
 std::atomic<int> g_bov_choice{0};
+std::atomic<bool> g_fi_sc{false};   // a supercharger is installed
+std::atomic<float> g_whl_amp{0.0f}, g_whl_freq{3000.0f};   // synthesised turbo whistle / supercharger whine (level, Hz)
 std::atomic<bool> g_fi_turbo{false};   // the installed forced induction is a turbo (not a supercharger)     // turbo / boost layers' effect 0 .. 2
 std::atomic<int> g_tur_tier{0};
 std::atomic<int> g_ov_exh{0}, g_ov_int{0};   // the driven car's chosen sound type: 0 = as installed, 1..4 = Stock / Street / Sport / Race
@@ -297,6 +299,7 @@ void car_seen(char* car) {
                 if (v >= 0) { const int l = v > 3 ? 3 : v; if (l > lv) lv = l; }
         g_tur_tier = lv;
         g_fi_turbo = fi[0] >= 0 || fi[1] >= 0 || fi[2] >= 0;
+        g_fi_sc = fi[3] >= 0 || fi[4] >= 0;
     }
     const char* engine = name;
     const char* gran = nullptr;
@@ -352,17 +355,37 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
                 g_thr = ts;
                 const float target = ts * (0.4f + 0.6f * rn);
                 g_load = g_load.load() + (target - g_load.load()) * 0.25f;
-                {   // intake air hiss level: forced induction level x amount x throttle-and-rev load
-                    static const float kLv[4] = {0, 0.5f, 0.8f, 1.0f};
-                    const float lv = g_fi_turbo.load() ? kLv[g_tur_tier.load() & 3] * (g_enabled.load() ? 1.0f : 0.0f) * g_air_amount.load() : 0.0f;
-                    float bn = 0.0f;   // boost pressure 0..1 (dyn+0x620 between its rest value dyn+0xEF4 and its top dyn+0xEF8; as the Anti-Lag mod reads it)
-                    float bv = 0, bmin = 0, bmax = 0;
-                    if (rd(dyn + 0x620, &bv, 4) && rd(dyn + 0xEF4, &bmin, 4) && rd(dyn + 0xEF8, &bmax, 4) && bv == bv && bmin == bmin && bmax == bmax && bmax - bmin > 1e-3f) {
-                        bn = (bv - bmin) / (bmax - bmin);
-                        bn = bn < 0 ? 0 : (bn > 1 ? 1 : bn);
+                {   // synthesised forced-induction sound: hiss + whistle follow the boost pressure (turbo) or the revs (supercharger)
+                    static const float kLv[4] = {0.3f, 0.55f, 0.8f, 1.0f}, kWh[4] = {0.012f, 0.02f, 0.03f, 0.045f};
+                    const int tr = g_tur_tier.load() & 3;
+                    const float en = g_enabled.load() ? 1.0f : 0.0f;
+                    float bn = 0.0f;
+                    float bv = 0, bmin = 0;
+                    static float bpk = 0, bmn = 1e9f;
+                    static float last_pk = 1e9f;
+                    if (g_rpm_peak.load() < last_pk) { bpk = 0; bmn = 1e9f; }   // a new car: the rev peak starts again
+                    last_pk = g_rpm_peak.load();
+                    if (rd(dyn + 0x620, &bv, 4) && bv == bv && bv > -1000 && bv < 1000) {
+                        if (bv < bmn) bmn = bv;
+                        if (bv > bpk) bpk = bv;
+                        const float span = bpk - bmn;
+                        if (span > 1.0f) { bn = (bv - bmn) / span; bn = bn < 0 ? 0 : (bn > 1 ? 1 : bn); }
                     }
-                    g_boost = g_boost.load() + (bn - g_boost.load()) * 0.3f;
-                    g_air = lv * std::pow(g_boost.load(), 1.2f);
+                    (void)bmin;
+                    g_boost = g_boost.load() + (bn - g_boost.load()) * 0.25f;
+                    const float b = g_boost.load();
+                    if (g_fi_turbo.load()) {
+                        g_air = kLv[tr] * en * g_air_amount.load() * std::pow(b, 1.1f);
+                        g_whl_amp = kWh[tr] * en * g_tur_amount.load() * std::pow(b, 1.4f);
+                        g_whl_freq = 2200.0f + 5200.0f * b;
+                    } else if (g_fi_sc.load()) {
+                        g_air = 0;
+                        g_whl_amp = kWh[tr] * 0.8f * en * g_tur_amount.load() * (0.15f + 0.85f * g_load.load()) * (0.3f + 0.7f * rn);
+                        g_whl_freq = 900.0f + 3600.0f * rn;
+                    } else { g_air = 0; g_whl_amp = 0; }
+                    static std::atomic<uint64_t> tnext{0};
+                    const uint64_t tn = GetTickCount64();
+                    if ((g_fi_turbo.load() || g_fi_sc.load()) && tn > tnext.load() && b > 0.02f) { tnext = tn + 5000; say("boost %.2f (raw %.2f, seen %.2f .. %.2f): hiss %.3f, whistle %.4f at %.0f Hz", b, bv, bmn, bpk, g_air.load(), g_whl_amp.load(), g_whl_freq.load()); }
                 }
             }
         }
@@ -563,7 +586,7 @@ inline float ftanh(float x) {
     const float x2 = x * x;
     return x * (27.0f + x2) / (27.0f + 9.0f * x2);
 }
-struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}, floor{0.4f}, vol{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}, nl[8] = {}, nh[8] = {}; uint32_t rng = 0x2545F491u; std::atomic<bool> air{false}, dead{false}; };
+struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}, floor{0.4f}, vol{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}, nl[8] = {}, nh[8] = {}; uint32_t rng = 0x2545F491u; float ph = 0, ph2 = 0; std::atomic<bool> air{false}, dead{false}; };
 thread_local Dsp* t_new_dsp = nullptr;
 constexpr float kSr = 48000.0f;
 
@@ -597,9 +620,18 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
     const float k = d->k.load() * dyn, drive = d->drive.load(), mix = d->mix.load() * dyn, bias = d->bias.load(), gain = 1.0f + (d->gain.load() - 1.0f) * dyn;
     const float vl = d->vol.load();
     const float tb = ftanh(bias);
-    const float airg = d->air.load() ? g_air.load() * 0.5f : 0.0f;   // intake air hiss: band-limited noise, 1.5 .. 7 kHz
+    const float airg = d->air.load() ? g_air.load() * 0.5f : 0.0f;
+    const float wamp = d->air.load() ? g_whl_amp.load() : 0.0f;
+    const float wfreq = g_whl_freq.load();
+    const float wstep = 6.2831853f * wfreq / kSr;   // intake air hiss: band-limited noise, 1.5 .. 7 kHz
     static const float nlp = 1.0f - std::exp(-6.2831853f * 7000.0f / kSr), nhp = 1.0f - std::exp(-6.2831853f * 1500.0f / kSr);
-    for (unsigned i = 0; i < length; ++i)
+    for (unsigned i = 0; i < length; ++i) {
+        float wh = 0;
+        if (wamp > 0.0005f) {   // turbo whistle: a pure tone plus its octave, a little airy
+            d->ph += wstep; if (d->ph > 6.2831853f) d->ph -= 6.2831853f;
+            d->ph2 += wstep * 2.01f; if (d->ph2 > 6.2831853f) d->ph2 -= 6.2831853f;
+            wh = (std::sin(d->ph) + 0.35f * std::sin(d->ph2)) * wamp;
+        }
         for (int c = 0; c < inch; ++c) {
             const float x = in[i * static_cast<unsigned>(inch) + static_cast<unsigned>(c)];
             const float ax = x < 0 ? -x : x;
@@ -622,8 +654,10 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
                 d->nh[c] += nhp * (d->nl[c] - d->nh[c]);
                 o += (d->nl[c] - d->nh[c]) * airg;
             }
+            o += wh;
             out[i * static_cast<unsigned>(inch) + static_cast<unsigned>(c)] = o;
         }
+    }
     return 0;
 }
 typedef int (*CreateDspDescFn)(void*, const void*, void**);
@@ -751,7 +785,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
         } else dp = sdp((cls == 1 ? kExhDp : kIntDp)[tier], cls == 1 ? g_exh_amount.load() : g_int_amount.load());
         dp.k = clampf(dp.k, 0, 1.5f); dp.mix = clampf(dp.mix, 0, 1.2f); dp.gain_db = clampf(dp.gain_db, 0, 6);
     }
-    const bool air_wanted = cls == 2 && !gran && !g_no_own_dsp && g_air_amount.load() > 0.01f && g_fi_turbo.load() && eff_turbo_tier() > 0;   // the intake tracks carry the air hiss
+    const bool air_wanted = cls == 2 && !gran && !g_no_own_dsp && (g_fi_turbo.load() || g_fi_sc.load());   // the intake tracks carry the air hiss
     const bool dp_on = !g_no_own_dsp && !gran && (cls == 5 || cls == 6 || air_wanted || dp.k > 0 || dp.mix > 0 || dp.gain_db > 0);   // granular cars: the EQ only (their loading stuck with our own effect)
     fx.low = clampf(fx.low, 0, 10); fx.mid = clampf(fx.mid, 0, 10); fx.high = clampf(fx.high, 0, 10); fx.band = clampf(fx.band, 0, 10);
     fx.dist = clampf(fx.dist, 0, 0.6f); fx.echo_wet = clampf(fx.echo_wet, -80, -6);
