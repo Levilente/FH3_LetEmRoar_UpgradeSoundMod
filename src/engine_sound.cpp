@@ -345,6 +345,13 @@ const Fx kIntFx[4] = {
 // 2. Harmonic rasp: the part above ~700 Hz goes through an asymmetric soft clipper (even + odd harmonics) and is mixed back low: a
 //    ragged, open edge instead of the hard "distorted" sound of a clipper over the whole signal.
 // 3. A little make-up gain, and a soft limiter so nothing clips.
+// a cheap tanh (rational, exact at 0, saturating at +-3): the effect runs on every track, so the real tanh costs too much
+inline float ftanh(float x) {
+    if (x > 3.0f) return 1.0f;
+    if (x < -3.0f) return -1.0f;
+    const float x2 = x * x;
+    return x * (27.0f + x2) / (27.0f + 9.0f * x2);
+}
 struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}, floor{0.4f}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}; std::atomic<bool> dead{false}; };
 thread_local Dsp* t_new_dsp = nullptr;
 constexpr float kSr = 48000.0f;
@@ -366,12 +373,18 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
     if (outch) *outch = inch;
     Dsp* d = *reinterpret_cast<Dsp**>(static_cast<char*>(st) + 8);
     if (!d || inch < 1 || inch > 8) { if (in != out) memcpy(out, in, sizeof(float) * length * static_cast<size_t>(inch > 0 ? inch : 1)); return 0; }
+    {   // silent block (most tracks, most of the time): nothing to shape, and no maths
+        const unsigned n = length * static_cast<unsigned>(inch);
+        float mx = 0;
+        for (unsigned i = 0; i < n; ++i) { const float a = in[i] < 0 ? -in[i] : in[i]; mx = a > mx ? a : mx; }
+        if (mx < 1e-5f) { if (in != out) memcpy(out, in, sizeof(float) * n); return 0; }
+    }
     static const float af = 1.0f - std::exp(-1.0f / (0.0007f * kSr)), rf = 1.0f - std::exp(-1.0f / (0.012f * kSr)),
                        as = 1.0f - std::exp(-1.0f / (0.030f * kSr)), rs = 1.0f - std::exp(-1.0f / (0.060f * kSr)),
                        al = 1.0f - std::exp(-6.2831853f * 700.0f / kSr);
     const float fl = d->floor.load(), dyn = fl + (1.0f - fl) * g_load.load();   // rawer under load, cleaner on a lift
     const float k = d->k.load() * dyn, drive = d->drive.load(), mix = d->mix.load() * dyn, bias = d->bias.load(), gain = 1.0f + (d->gain.load() - 1.0f) * dyn;
-    const float tb = std::tanh(bias);
+    const float tb = ftanh(bias);
     for (unsigned i = 0; i < length; ++i)
         for (int c = 0; c < inch; ++c) {
             const float x = in[i * static_cast<unsigned>(inch) + static_cast<unsigned>(c)];
@@ -383,18 +396,18 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
             const float y = x * g;
             d->lp[c] += al * (y - d->lp[c]);
             const float hp = y - d->lp[c];
-            const float wet = (std::tanh(drive * hp + bias) - tb) * 0.7f;
+            const float wet = (ftanh(drive * hp + bias) - tb) * 0.7f;
             d->wl[c] += 0.45f * (wet - d->wl[c]);   // the added rasp is smoothed above ~7 kHz: ragged, not fizzy
             float o = (y + mix * d->wl[c]) * gain;
             const float ao = o < 0 ? -o : o;
-            if (ao > 0.8f) o = (o < 0 ? -1.0f : 1.0f) * (0.8f + 0.2f * std::tanh((ao - 0.8f) / 0.2f));
+            if (ao > 0.8f) o = (o < 0 ? -1.0f : 1.0f) * (0.8f + 0.2f * ftanh((ao - 0.8f) / 0.2f));
             out[i * static_cast<unsigned>(inch) + static_cast<unsigned>(c)] = o;
         }
     return 0;
 }
 typedef int (*CreateDspDescFn)(void*, const void*, void**);
 Dsp* make_dsp(void* sys, void** dsp_out) {
-    unsigned char desc[0xD8] = {};
+    static unsigned char desc[0xD8] = {};   // static: FMOD may keep a pointer to it
     *reinterpret_cast<unsigned*>(desc + 0x00) = 108;                 // pluginsdkversion (what the game's own plugin descriptions say)
     memcpy(desc + 4, "EngineSoundTiers", 17);                        // name[32]
     *reinterpret_cast<unsigned*>(desc + 0x24) = 0x00010000;          // version
@@ -434,7 +447,7 @@ void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) 
     static const float af = 1.0f - std::exp(-1.0f / (0.0007f * kSr)), rf = 1.0f - std::exp(-1.0f / (0.012f * kSr)),
                        as = 1.0f - std::exp(-1.0f / (0.030f * kSr)), rs = 1.0f - std::exp(-1.0f / (0.060f * kSr)),
                        al = 1.0f - std::exp(-6.2831853f * 700.0f / kSr);
-    const float a1 = 1.0f - std::exp(-6.2831853f * b.x1 / kSr), a2 = 1.0f - std::exp(-6.2831853f * b.x2 / kSr), tb = std::tanh(b.bias);
+    const float a1 = 1.0f - std::exp(-6.2831853f * b.x1 / kSr), a2 = 1.0f - std::exp(-6.2831853f * b.x2 / kSr), tb = ftanh(b.bias);
     Dsp& d = in.d;
     for (unsigned i = 0; i < frames; ++i)
         for (int c = 0; c < ch; ++c) {
@@ -449,11 +462,11 @@ void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) 
             g = g < 0.5f ? 0.5f : (g > 2.5f ? 2.5f : g);
             const float y = x * g;
             d.lp[c] += al * (y - d.lp[c]);
-            const float wet = (std::tanh(b.drive * (y - d.lp[c]) + b.bias) - tb) * 0.7f;
+            const float wet = (ftanh(b.drive * (y - d.lp[c]) + b.bias) - tb) * 0.7f;
             d.wl[c] += 0.45f * (wet - d.wl[c]);
             float o = (y + b.mix * d.wl[c]) * b.gain;
             const float ao = o < 0 ? -o : o;
-            if (ao > b.limit) o = (o < 0 ? -1.0f : 1.0f) * (b.limit + (1.0f - b.limit) * std::tanh((ao - b.limit) / (1.0f - b.limit)));
+            if (ao > b.limit) o = (o < 0 ? -1.0f : 1.0f) * (b.limit + (1.0f - b.limit) * ftanh((ao - b.limit) / (1.0f - b.limit)));
             buf[i * static_cast<unsigned>(ch) + static_cast<unsigned>(c)] = o;
         }
 }
