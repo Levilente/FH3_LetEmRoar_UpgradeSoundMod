@@ -135,6 +135,7 @@ constexpr size_t kCarIface = 0x71E8, kIfaceToDyn = 0x4B0, kDynThrottle = 0x1BD0,
 std::atomic<int> g_bank_pg{-1}, g_bank_gs{-1};
 bool g_no_graph = false, g_no_own_dsp = false, g_no_echo = false;
 std::atomic<uint64_t> g_hud_tick{0}, g_busy_until{0};   // the HUD ticks every frame in the world, never on a loading screen
+std::atomic<long> g_grp_new{0}, g_grp_reuse{0};   // groups given an effect: new pointers / pointers seen before
 std::atomic<long> g_dc[5]{};   // diagnostics for the driven car: plays classified as other / exhaust / engine bay
 std::atomic<uint64_t> g_dnext{0};
 std::atomic<long> g_n_groups{0}, g_n_err{0};   // rows of kBankTier of the driven car's banks, -1 = not known
@@ -220,7 +221,7 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
         const uint64_t dn = g_dnext.load();
         if (dn && now > dn) {
             g_dnext = now + 60000;
-            say("sounds of the driven car so far: exhaust %ld, engine bay %ld, other %ld (tracks with effect: %ld); throttle %.2f, load %.2f, rev peak %.0f", g_dc[1].load(), g_dc[2].load(), g_dc[0].load(), g_n_groups.load(), g_thr.load(), g_load.load(), g_rpm_peak.load());
+            say("sounds of the driven car so far: exhaust %ld, engine bay %ld, other %ld (tracks with effect: %ld = %ld new groups + %ld seen before); throttle %.2f, load %.2f, rev peak %.0f", g_dc[1].load(), g_dc[2].load(), g_dc[0].load(), g_n_groups.load(), g_grp_new.load(), g_grp_reuse.load(), g_thr.load(), g_load.load(), g_rpm_peak.load());
         }
     }
     char* car = nullptr;
@@ -522,6 +523,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
     const bool nothing = !dp_on && fx.low == 0 && fx.mid == 0 && fx.high == 0 && fx.band == 0 && fx.echo_wet <= -80;
 
     const unsigned serial = g_cfg_serial.load();
+    const bool known = g_groups.count(grp) != 0;
     Group& g = g_groups[grp];
     // Is our EQ still on this group? (A group's memory is reused for a new group when its event ends.)
     bool have = false;
@@ -533,6 +535,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
         }
     }
     if (!have) {
+        (known ? g_grp_reuse : g_grp_new).fetch_add(1);
         g = Group{};
         if (nothing) return;   // stock: the group stays untouched
         void* eq = nullptr;
@@ -864,7 +867,7 @@ DWORD WINAPI worker(LPVOID) {
         if (GetTickCount64() < next) continue;
         next += 4000;
         const long c = g_n_create.load(), p = g_n_play.load(), a = g_n_apply.load();
-        if (c - c0 > 150) g_busy_until = GetTickCount64() + 6000;
+        if (c - c0 > 150) g_busy_until = GetTickCount64() + 2500;
         if (c - c0 > 300 || a - a0 > 300) {
             say("busy: %ld sounds created, %ld played, %ld effect set-ups in the last 4 s (slowest set-up so far %.1f ms)", c - c0, p - p0, a - a0, g_apply_max_us.load() / 1000.0);
             g_apply_max_us = 0;
