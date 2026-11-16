@@ -90,3 +90,6 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 
 ### 1.11.12
 - No hiss in the tuning menu / pause: frozen physics readings count as no boost, and no HUD frames silence the hiss.
+
+### 1.12.0
+- Air hiss reworked: it is made by exactly one effect instance at a time (before: once per intake track, a flat constant layer that never went away), and only from live physics (stops within 0.25 s in menus, pauses, or when the car can't be read).

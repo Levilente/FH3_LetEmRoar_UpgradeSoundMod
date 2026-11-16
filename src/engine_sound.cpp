@@ -106,7 +106,25 @@ std::atomic<float> g_pipe{1.0f};        // pipe resonance amount 0 .. 2 (short e
 std::atomic<float> g_air_amount{1.0f}, g_air{0.0f}, g_boost{0.0f};   // intake air hiss: the car's amount 0 .. 2, and the level in force (follows throttle and revs)
 std::atomic<float> g_tur_amount{1.0f}, g_bov_amount{1.0f};
 std::atomic<int> g_bov_choice{0};
-std::atomic<bool> g_fi_sc{false};   // a supercharger is installed
+std::atomic<bool> g_fi_sc{false};
+// The intake air hiss is made in exactly ONE place (one effect instance at a time, its "owner"): every intake track carrying it made it
+// once per track (a flat, constant layer), and a value that stopped being updated (a menu, a failed read) kept it going for ever.
+std::atomic<uint64_t> g_air_tick{0};       // when the hiss level was last worked out from live physics
+std::atomic<void*> g_air_owner{nullptr};
+std::atomic<uint64_t> g_air_owner_t{0};
+float air_level() { return g_air.load(); }
+float air_gain(void* self, bool sounding) {
+    const uint64_t now = GetTickCount64();
+    if (now - g_air_tick.load() > 250) return 0.0f;   // no live physics lately
+    const float a = air_level();
+    if (a <= 0.002f) return 0.0f;
+    if (g_air_owner.load() != self) {
+        if (now - g_air_owner_t.load() <= 120 || !sounding) return 0.0f;   // another instance makes it (or this track is idle)
+        g_air_owner = self;
+    }
+    g_air_owner_t = now;
+    return a * 0.5f;
+}   // a supercharger is installed
 std::atomic<float> g_whl_amp{0.0f}, g_whl_freq{3000.0f};   // synthesised turbo whistle / supercharger whine (level, Hz)
 std::atomic<bool> g_fi_turbo{false};   // the installed forced induction is a turbo (not a supercharger)     // turbo / boost layers' effect 0 .. 2
 std::atomic<int> g_tur_tier{0};
@@ -397,6 +415,8 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
                         g_whl_amp = 0;
                         g_whl_freq = 900.0f + 3600.0f * rn;
                     } else { g_air = 0; g_whl_amp = 0; }
+                    if (frozen) { g_air = 0; g_boost = 0; }
+                    else g_air_tick = GetTickCount64();
                     static std::atomic<uint64_t> tnext{0};
                     const uint64_t tn = GetTickCount64();
                     if ((g_fi_turbo.load() || g_fi_sc.load()) && tn > tnext.load() && b > 0.02f) { tnext = tn + 5000; say("boost %.2f (raw %.2f, seen %.2f .. %.2f): hiss %.3f, whistle %.4f at %.0f Hz", b, bv, bmn, bpk, g_air.load(), g_whl_amp.load(), g_whl_freq.load()); }
@@ -600,7 +620,7 @@ inline float ftanh(float x) {
     const float x2 = x * x;
     return x * (27.0f + x2) / (27.0f + 9.0f * x2);
 }
-struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}, floor{0.4f}, vol{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}, nl[8] = {}, nh[8] = {}; uint32_t rng = 0x2545F491u; float ph = 0, ph2 = 0; std::atomic<bool> air{false}, dead{false}; std::atomic<int> kind{0}; };
+struct Dsp { std::atomic<float> k{0}, drive{1}, mix{0}, bias{0}, gain{1}, floor{0.4f}, vol{1}; float ef[8] = {}, es[8] = {}, lp[8] = {}, wl[8] = {}, nl[8] = {}, nh[8] = {}; uint32_t rng = 0x2545F491u; float ph = 0, ph2 = 0; std::atomic<bool> air{false}, dead{false}; std::atomic<int> kind{0}; float airg_now = 0; };
 thread_local Dsp* t_new_dsp = nullptr;
 constexpr float kSr = 48000.0f;
 
@@ -625,7 +645,8 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
         const unsigned n = length * static_cast<unsigned>(inch);
         float mx = 0;
         for (unsigned i = 0; i < n; ++i) { const float a = in[i] < 0 ? -in[i] : in[i]; mx = a > mx ? a : mx; }
-        if (mx < 1e-5f && !(d->air.load() && g_air.load() > 0.002f)) { if (in != out) memcpy(out, in, sizeof(float) * n); return 0; }   // (the hiss goes on over a silent intake)
+        d->airg_now = d->air.load() ? air_gain(d, mx >= 1e-5f) : 0.0f;
+        if (mx < 1e-5f && d->airg_now <= 0) { if (in != out) memcpy(out, in, sizeof(float) * n); return 0; }   // (the hiss goes on over a silent intake)
     }
     static const float af = 1.0f - std::exp(-1.0f / (0.0007f * kSr)), rf = 1.0f - std::exp(-1.0f / (0.012f * kSr)),
                        as = 1.0f - std::exp(-1.0f / (0.030f * kSr)), rs = 1.0f - std::exp(-1.0f / (0.060f * kSr)),
@@ -645,8 +666,7 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
     }
     const float tb = ftanh(bias);
     const float lim = d->kind.load() >= 5 ? 9.0f : 0.8f;   // turbo / blow-off layers: no soft limiter (a loud setting must stay louder)
-    const bool live = GetTickCount64() - g_hud_tick.load() < 400;   // no HUD frames: a menu or a pause, no hiss
-    const float airg = d->air.load() && live ? g_air.load() * 0.5f : 0.0f;
+    const float airg = d->airg_now;
     const float wamp = d->air.load() ? g_whl_amp.load() : 0.0f;
     const float wfreq = g_whl_freq.load();
     const float wstep = 6.2831853f * wfreq / kSr;   // intake air hiss: band-limited noise, 1.5 .. 7 kHz
@@ -730,7 +750,7 @@ void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) 
                        al = 1.0f - std::exp(-6.2831853f * 700.0f / kSr);
     const float a1 = 1.0f - std::exp(-6.2831853f * b.x1 / kSr), a2 = 1.0f - std::exp(-6.2831853f * b.x2 / kSr), tb = ftanh(b.bias);
     Dsp& d = in.d;
-    const float airg = (g_fi_turbo.load() && g_enabled.load() && GetTickCount64() - g_hud_tick.load() < 400) ? g_air.load() * 0.5f : 0.0f;   // the intake air hiss of a turbo car (a granular engine has one track: it goes in here)
+    const float airg = (g_fi_turbo.load() && g_enabled.load()) ? air_gain(&in, true) : 0.0f;   // the intake air hiss of a turbo car (a granular engine has one track: it goes in here)
     static const float nlp = 1.0f - std::exp(-6.2831853f * 7000.0f / kSr), nhp = 1.0f - std::exp(-6.2831853f * 1500.0f / kSr);
     for (unsigned i = 0; i < frames; ++i)
         for (int c = 0; c < ch; ++c) {
@@ -940,7 +960,7 @@ int detour_synth(void* st, float* in, float* out, unsigned length, int inch, int
     int ch = outch ? *outch : inch;
     if (r != 0 || !out || length == 0 || length > 4096 || ch < 1 || ch > 8) return r;
     const int te = synth_tier(1), ti = synth_tier(0);
-    if (te == 0 && ti == 0 && !(g_fi_turbo.load() && g_enabled.load() && g_air.load() > 0.002f)) return r;   // stock sound and no hiss to add: left alone
+    if (te == 0 && ti == 0 && !(g_fi_turbo.load() && g_enabled.load() && g_air.load() > 0.002f && GetTickCount64() - g_air_tick.load() < 250)) return r;   // stock sound and no hiss to add: left alone
     const float ea = g_exh_amount.load(), ia = g_int_amount.load(), rasp = g_rasp.load() * 4.0f > 2.5f ? 2.5f : g_rasp.load() * 4.0f;
     const Fx &fe = kExhFx[te], &fi = kIntFx[ti];
     const Dp &de = kExhDp[te], &di = kIntDp[ti];
