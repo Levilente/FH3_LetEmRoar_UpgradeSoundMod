@@ -68,3 +68,7 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 
 ### 1.11.5
 - The turbo's loudness no longer follows boost pressure (the game's own curve only); the slider scales it.
+
+### 1.11.6
+- Turbo volume follows the boost pressure again (like the hiss); slider range wider (200% about 6x at full boost); blow-off 200% likewise.
+- Log line "settings of garage car N: ..." whenever the car whose settings are in force changes.

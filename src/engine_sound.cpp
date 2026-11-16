@@ -153,7 +153,11 @@ void cfg_apply(const CarCfg& c) {   // make it the settings in force (the driven
     if (g_bov_choice.exchange(c.bc) != c.bc) g_cfg_serial.fetch_add(1);
     if (ch) g_cfg_serial.fetch_add(1);
 }
-void sel_refresh(uint32_t garage) { cfg_apply(cfg_of(garage)); g_cfg_serial.fetch_add(1); }
+void sel_refresh(uint32_t garage) {
+    const CarCfg c = cfg_of(garage);
+    cfg_apply(c); g_cfg_serial.fetch_add(1);
+    say("settings of garage car %u: types %d/%d, exhaust %d%%, intake %d%%, rasp %d, pipe %d%%, pops %d%%, turbo %d%%, hiss %d%%, blow-off %d%%", garage, c.e, c.i, c.ea, c.ia, c.rasp, c.pipe, c.pops, c.ta, c.ah, c.bv);
+}
 void sel_load() {
     wchar_t buf[8192] = {};
     GetPrivateProfileSectionW(L"Cars", buf, 8192, g_ini);
@@ -625,10 +629,9 @@ int dsp_read(void* st, float* in, float* out, unsigned length, int inch, int* ou
         (void)kTv; (void)kBv; (void)t;
         if (kd == 5) {   // 100% = the game's own level; 200% about 3x; the game's own loudness curve stays
             const float b = g_boost.load();
-            (void)b;
-            vl = std::pow(g_tur_amount.load(), 1.6f);
-        } else if (kd == 6) vl = std::pow(g_bov_amount.load(), 1.6f);
-        vl = vl < 0 ? 0 : (vl > 4.0f ? 4.0f : vl);
+            vl = std::pow(g_tur_amount.load(), 2.6f) * (0.2f + 0.8f * std::pow(b, 0.7f));   // 200% = about 6x at full boost
+        } else if (kd == 6) vl = std::pow(g_bov_amount.load(), 2.6f);
+        vl = vl < 0 ? 0 : (vl > 8.0f ? 8.0f : vl);
     }
     const float tb = ftanh(bias);
     const float airg = d->air.load() ? g_air.load() * 0.5f : 0.0f;
