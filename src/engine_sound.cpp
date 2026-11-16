@@ -15,6 +15,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -97,12 +98,12 @@ bool rd(const void* p, void* dst, size_t n) {
 
 // ---- settings -----------------------------------------------------------------------------------------------------------
 std::atomic<int> g_enabled{1};
-std::atomic<int> g_preview{0};          // 0 = the car's own parts, 1..4 = force Stock / Street / Sport / Race on both
 std::atomic<float> g_exh_amount{1.0f};  // 0 .. 2
 std::atomic<float> g_int_amount{1.0f};
 std::atomic<float> g_rasp{0.25f};
 std::atomic<float> g_pops{1.0f};         // 0 .. 2, extra backfire pops
-std::atomic<int> g_pipe{1};             // pipe resonance (short echo) on the Sport / Race exhaust        // 0 .. 2, scales the distortion (the rasp) of every level
+std::atomic<float> g_pipe{1.0f};        // pipe resonance amount 0 .. 2 (short echo on the Sport / Race exhaust)
+std::atomic<int> g_ov_exh{0}, g_ov_int{0};   // the driven car's chosen sound type: 0 = as installed, 1..4 = Stock / Street / Sport / Race
 std::atomic<int> g_all_cars{0};         // also other cars that use the same sound bank (they do anyway); 1 = every car on the road
 std::atomic<unsigned> g_cfg_serial{1};  // bumped when anything that changes the effect changes
 
@@ -115,9 +116,7 @@ void ini_set(const wchar_t* key, int v) {
 }
 void on_change(void*, const char* key, int value) {
     if (!strcmp(key, "Enabled")) { g_enabled = value; ini_set(L"Enabled", value); }
-    else if (!strcmp(key, "Preview")) { g_preview = value; ini_set(L"Preview", value); }
-    else if (!strcmp(key, "Pipe")) { g_pipe = value; ini_set(L"Pipe", value); }
-    else if (!strcmp(key, "AllCars")) { g_all_cars = value; ini_set(L"AllCars", value); }
+            else if (!strcmp(key, "AllCars")) { g_all_cars = value; ini_set(L"AllCars", value); }
     g_cfg_serial.fetch_add(1);
 }
 void on_slide(void*, const char* key, float value) {
@@ -125,11 +124,65 @@ void on_slide(void*, const char* key, float value) {
     else if (!strcmp(key, "Pops")) { g_pops = value / 100.0f; ini_set(L"Pops", static_cast<int>(value + 0.5f)); }
     else if (!strcmp(key, "Rasp")) { g_rasp = value / 100.0f; ini_set(L"Rasp", static_cast<int>(value + 0.5f)); }
     else if (!strcmp(key, "IntakeAmount")) { g_int_amount = value / 100.0f; ini_set(L"IntakeAmount", static_cast<int>(value + 0.5f)); }
+    else if (!strcmp(key, "PipeAmount")) { g_pipe = value / 100.0f; ini_set(L"PipeAmount", static_cast<int>(value + 0.5f)); }
     g_cfg_serial.fetch_add(1);
 }
 
-// ---- the driven car: its levels and its sound bank ----------------------------------------------------------------------
 std::atomic<int> g_exh_tier{0}, g_int_tier{0};
+// ---- the sound type chosen per car (Tune Car > Engine) --------------------------------------------------------------------
+std::mutex g_selmu;
+std::unordered_map<uint32_t, std::pair<int, int>> g_sel;   // garage id -> {exhaust, intake} choice, 0 = as installed
+uint32_t g_sel_garage = 0;
+void sel_refresh(uint32_t garage) {
+    std::pair<int, int> v{0, 0};
+    {
+        std::lock_guard<std::mutex> l(g_selmu);
+        auto it = g_sel.find(garage);
+        if (it != g_sel.end()) v = it->second;
+        g_sel_garage = garage;
+    }
+    if (g_ov_exh.exchange(v.first) != v.first || g_ov_int.exchange(v.second) != v.second) g_cfg_serial.fetch_add(1);
+}
+void sel_load() {
+    wchar_t buf[8192] = {};
+    GetPrivateProfileSectionW(L"Cars", buf, 8192, g_ini);
+    for (const wchar_t* q = buf; *q; q += wcslen(q) + 1) {
+        unsigned id = 0; int e = 0, i = 0;
+        if (swscanf(q, L"%u=%d,%d", &id, &e, &i) == 3 && id && e >= 0 && e <= 4 && i >= 0 && i <= 4) g_sel[id] = {e, i};
+    }
+}
+void sel_set(int exh, int v) {
+    const uint32_t id = g_api && g_api->upgrade_active_garage ? g_api->upgrade_active_garage() : 0;
+    if (!id) return;
+    std::pair<int, int> cur;
+    {
+        std::lock_guard<std::mutex> l(g_selmu);
+        auto& e = g_sel[id];
+        (exh ? e.first : e.second) = v;
+        cur = e;
+    }
+    wchar_t k[16], t[16];
+    _snwprintf(k, 16, L"%u", id);
+    _snwprintf(t, 16, L"%d,%d", cur.first, cur.second);
+    WritePrivateProfileStringW(L"Cars", k, (cur.first || cur.second) ? t : nullptr, g_ini);
+    sel_refresh(id);
+}
+float sel_get(int exh) {
+    const uint32_t id = g_api && g_api->upgrade_active_garage ? g_api->upgrade_active_garage() : 0;
+    std::lock_guard<std::mutex> l(g_selmu);
+    auto it = g_sel.find(id);
+    return it == g_sel.end() ? 0.0f : static_cast<float>(exh ? it->second.first : it->second.second);
+}
+// the tier to use for the driven car's exhaust (exh) or intake
+int eff_tier(int exh) {
+    int t = exh ? g_exh_tier.load() : g_int_tier.load();
+    const int ov = exh ? g_ov_exh.load() : g_ov_int.load();
+    if (ov >= 1 && ov <= 4) t = ov - 1;
+    if (!g_enabled.load()) t = 0;
+    return t;
+}
+
+// ---- the driven car: its levels and its sound bank ----------------------------------------------------------------------
 std::atomic<float> g_load{0.0f};   // 0..1: throttle x revs of the driven car, smoothed (an open pipe is rawest under load)
 std::atomic<float> g_thr{0.0f};
 std::atomic<float> g_rpm_peak{0.0f};
@@ -226,6 +279,11 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
             g_dnext = now + 60000;
             say("sounds of the driven car so far: exhaust %ld, engine bay %ld, other %ld (tracks with effect: %ld = %ld new groups + %ld seen before; %ld effect sets re-used); throttle %.2f, load %.2f, rev peak %.0f", g_dc[1].load(), g_dc[2].load(), g_dc[0].load(), g_n_groups.load(), g_grp_new.load(), g_grp_reuse.load(), g_n_released.load(), g_thr.load(), g_load.load(), g_rpm_peak.load());
         }
+    }
+    if (g_api->upgrade_active_garage) {   // the driven (or tuned) car's sound type choice
+        static uint32_t last_garage = 0xFFFFFFFFu;
+        const uint32_t gid = g_api->upgrade_active_garage();
+        if (gid != last_garage) { last_garage = gid; sel_refresh(gid); }
     }
     char* car = nullptr;
     void* cb  = nullptr;
@@ -485,19 +543,14 @@ std::unordered_map<void*, Group> g_groups;   // track channel groups that carry 
 template <class F> F fn(uintptr_t rva) { return reinterpret_cast<F>(g_game + rva); }
 
 void apply(void* sys, void* grp, int cls, bool gran) {
-    const int pv = g_preview.load();
-    auto pick = [&](int exh) {
-        int t = exh ? g_exh_tier.load() : g_int_tier.load();
-        if (pv >= 1 && pv <= 4) t = pv - 1;
-        if (!g_enabled.load()) t = 0;
-        return t;
-    };
+    auto pick = [&](int exh) { return eff_tier(exh); };
     auto scaled = [&](const Fx& f, float a) {
         Fx r = f;
         r.low *= a; r.mid *= a; r.high *= a; r.band *= a;
         r.dist *= a * g_rasp.load();
-        if (a <= 0.01f || !g_pipe.load()) r.echo_wet = -80;
-        else if (r.echo_wet > -80) r.echo_wet += 8.0f * (a - 1.0f);   // amount 200% = 8 dB more ring, 50% = 4 dB less
+        const float pa = g_pipe.load();
+        if (a <= 0.01f || pa <= 0.01f) r.echo_wet = -80;
+        else if (r.echo_wet > -80) r.echo_wet += 8.0f * (a - 1.0f) + 10.0f * (pa - 1.0f);   // pipe resonance 200% = 10 dB more ring, 50% = 5 dB less   // amount 200% = 8 dB more ring, 50% = 4 dB less
         return r;
     };
     int tier;
@@ -630,13 +683,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
 }
 
 float db2lin(float db) { return std::pow(10.0f, db / 20.0f); }
-int synth_tier(int exh) {
-    int t = exh ? g_exh_tier.load() : g_int_tier.load();
-    const int pv = g_preview.load();
-    if (pv >= 1 && pv <= 4) t = pv - 1;
-    if (!g_enabled.load()) t = 0;
-    return t;
-}
+int synth_tier(int exh) { return eff_tier(exh); }
 int detour_synth(void* st, float* in, float* out, unsigned length, int inch, int* outch) {
     const int r = g_orig_synth(st, in, out, length, inch, outch);
     int ch = outch ? *outch : inch;
@@ -737,10 +784,7 @@ int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch)
     }
     const bool gran = g_bank_gs.load() >= 0 || (row >= 0 && !strncmp(kBankTier[row].name, "GS_", 3));
     if (cls == 4 && !gran) {   // one of the game's backfire pops: with a better exhaust it is played once more (a "double crack", a little off in pitch)
-        int tier = g_exh_tier.load();
-        const int pv = g_preview.load();
-        if (pv >= 1 && pv <= 4) tier = pv - 1;
-        if (!g_enabled.load()) tier = 0;
+        const int tier = eff_tier(1);
         static const float kP[4] = {0, 0.25f, 0.55f, 0.90f};
         static uint32_t rng = 0x9E3779B9u;
         static std::atomic<uint64_t> last{0};
@@ -911,7 +955,7 @@ DWORD WINAPI worker(LPVOID) {
 } // namespace
 
 FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
-    if (api->api_version < 9) return 1;   // choice rows are API 9
+    if (api->api_version < 9) return 1;
     g_api = api;
     FH3ModInfo info{};
     info.size             = sizeof info;
@@ -926,12 +970,12 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
 
     _snwprintf(g_ini, MAX_PATH, L"%ls\\fh3-mods\\EngineSoundTiers.ini", api->azimuth_dir);
     g_enabled    = ini_int(L"Enabled", 1);
-    g_preview    = ini_int(L"Preview", 0);
     g_all_cars   = ini_int(L"AllCars", 0);
     g_exh_amount = static_cast<float>(ini_int(L"ExhaustAmount", 100)) / 100.0f;
     g_int_amount = static_cast<float>(ini_int(L"IntakeAmount", 100)) / 100.0f;
-    g_rasp       = static_cast<float>(ini_int(L"Rasp", 25)) / 100.0f;
-    g_pipe       = ini_int(L"Pipe", 1);
+    g_rasp       = static_cast<float>(std::min(35, std::max(0, ini_int(L"Rasp", 25)))) / 100.0f;
+    g_pipe       = static_cast<float>(std::min(200, std::max(0, ini_int(L"PipeAmount", ini_int(L"Pipe", 1) ? 100 : 0)))) / 100.0f;
+    sel_load();
     g_pops       = static_cast<float>(ini_int(L"Pops", 100)) / 100.0f;
 
     FH3Setting s{};
@@ -941,49 +985,44 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     s.value = g_enabled.load(); s.on_change = on_change;
     api->add_setting(g_mod, &s);
 
-    static const char* const kPreview[] = {"The car's own parts", "Stock", "Street", "Sport", "Race"};
-    FH3Setting p{};
-    p.size = sizeof p;
-    p.key = "Preview"; p.label = "Sound level";
-    p.description = "Which level you hear. \"The car's own parts\" follows the fitted intake and exhaust; the others force that level on both, to listen to it without buying parts.";
-    p.kind = FH3_SETTING_CHOICE; p.value = g_preview.load(); p.on_change = on_change;
-    p.choices = kPreview; p.choice_count = 5;
-    api->add_setting(g_mod, &p);
-
-    FH3Setting e{};
-    e.size = sizeof e;
-    e.key = "ExhaustAmount"; e.label = "Exhaust effect (%)";
-    e.description = "How strongly the exhaust level changes the sound. 100 is the mod's own setting, 0 is none, 200 is double.";
-    e.kind = FH3_SETTING_SLIDER; e.min = 0; e.max = 200; e.step = 10; e.slider_value = g_exh_amount.load() * 100.0f; e.on_slide = on_slide;
-    api->add_setting(g_mod, &e);
-
-    FH3Setting i{};
-    i.size = sizeof i;
-    i.key = "IntakeAmount"; i.label = "Intake effect (%)";
-    i.description = "How strongly the intake level changes the sound. 100 is the mod's own setting, 0 is none, 200 is double.";
-    i.kind = FH3_SETTING_SLIDER; i.min = 0; i.max = 200; i.step = 10; i.slider_value = g_int_amount.load() * 100.0f; i.on_slide = on_slide;
-    api->add_setting(g_mod, &i);
-
-    FH3Setting rs{};
-    rs.size = sizeof rs;
-    rs.key = "Rasp"; rs.label = "Rasp / grit (%)";
-    rs.description = "How much grit the higher levels add on top of the open, bright tone. 0 is none (clean), 100 is the mod's full grit, 200 is double. Too much sounds distorted.";
-    rs.kind = FH3_SETTING_SLIDER; rs.min = 0; rs.max = 200; rs.step = 5; rs.slider_value = g_rasp.load() * 100.0f; rs.on_slide = on_slide;
-    api->add_setting(g_mod, &rs);
-
-    FH3Setting po{};
-    po.size = sizeof po;
-    po.key = "Pops"; po.label = "Extra exhaust pops (%)";
-    po.description = "How much more the exhaust pops and crackles on a lift with better exhaust parts (Street a little, Race a lot). 0 is none, 200 is double. The game's own pop samples are played an extra time; the Anti-Lag mod's pops are not changed, they just come more often.";
-    po.kind = FH3_SETTING_SLIDER; po.min = 0; po.max = 200; po.step = 10; po.slider_value = g_pops.load() * 100.0f; po.on_slide = on_slide;
-    api->add_setting(g_mod, &po);
-
-    FH3Setting pp{};
-    pp.size = sizeof pp;
-    pp.key = "Pipe"; pp.label = "Pipe resonance";
-    pp.description = "The hollow ring of a freer exhaust pipe on the Sport and Race exhaust. Off: only the tone changes.";
-    pp.value = g_pipe.load(); pp.on_change = on_change;
-    api->add_setting(g_mod, &pp);
+    if (api->api_version >= 17) {
+        // Tune Car > Engine tab: sliders only
+        static const FH3TuningRow rows[] = {
+            {sizeof(FH3TuningRow), "SndExh", "Engine sound|Exhaust sound type (0-4)",
+             "0 = as installed on the car (default), 1 = Stock, 2 = Street, 3 = Sport, 4 = Race. Forces that exhaust sound on this car, e.g. a loud one on a weak car. Heard after the car's sound is loaded again (drive off, or switch cars).",
+             0, 4, 1, 0, [](void*) { return sel_get(1); }, [](void*, float v) { sel_set(1, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
+            {sizeof(FH3TuningRow), "SndInt", "Engine sound|Intake sound type (0-4)",
+             "0 = as installed on the car (default), 1 = Stock, 2 = Street, 3 = Sport, 4 = Race. Forces that intake sound on this car. Heard after the car's sound is loaded again.",
+             0, 4, 1, 0, [](void*) { return sel_get(0); }, [](void*, float v) { sel_set(0, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
+            {sizeof(FH3TuningRow), "ExhaustAmount", "Engine sound|Exhaust intensity (%)",
+             "How strongly the exhaust level changes the sound. 100 is the mod's own setting, 0 is none, 200 is double.",
+             0, 200, 5, 0, [](void*) { return g_exh_amount.load() * 100.0f; }, [](void*, float v) { on_slide(nullptr, "ExhaustAmount", v); }, nullptr, nullptr, "Engine"},
+            {sizeof(FH3TuningRow), "IntakeAmount", "Engine sound|Intake intensity (%)",
+             "How strongly the intake level changes the sound. 100 is the mod's own setting, 0 is none, 200 is double.",
+             0, 200, 5, 0, [](void*) { return g_int_amount.load() * 100.0f; }, [](void*, float v) { on_slide(nullptr, "IntakeAmount", v); }, nullptr, nullptr, "Engine"},
+            {sizeof(FH3TuningRow), "Rasp", "Engine sound|Rasp / grit (%)",
+             "How much grit the higher levels add on top of the open, bright tone. 0 is clean, 35 is the most. It follows throttle and revs.",
+             0, 35, 1, 0, [](void*) { return g_rasp.load() * 100.0f; }, [](void*, float v) { on_slide(nullptr, "Rasp", v); }, nullptr, nullptr, "Engine"},
+            {sizeof(FH3TuningRow), "PipeAmount", "Engine sound|Pipe resonance (%)",
+             "The hollow ring of a freer exhaust pipe on the Sport and Race exhaust. 0 is none, 100 is the mod's own, 200 is double.",
+             0, 200, 5, 0, [](void*) { return g_pipe.load() * 100.0f; }, [](void*, float v) { on_slide(nullptr, "PipeAmount", v); }, nullptr, nullptr, "Engine"},
+            {sizeof(FH3TuningRow), "Pops", "Engine sound|Extra exhaust pops (%)",
+             "How much more the exhaust pops and crackles on a lift with better exhaust parts. 0 is none, 200 is double.",
+             0, 200, 5, 0, [](void*) { return g_pops.load() * 100.0f; }, [](void*, float v) { on_slide(nullptr, "Pops", v); }, nullptr, nullptr, "Engine"},
+        };
+        for (const FH3TuningRow& r : rows) api->add_tuning_row(g_mod, &r);
+    } else {
+        FH3Setting e{};
+        e.size = sizeof e;
+        e.key = "ExhaustAmount"; e.label = "Exhaust effect (%)";
+        e.kind = FH3_SETTING_SLIDER; e.min = 0; e.max = 200; e.step = 10; e.slider_value = g_exh_amount.load() * 100.0f; e.on_slide = on_slide;
+        api->add_setting(g_mod, &e);
+        FH3Setting i{};
+        i.size = sizeof i;
+        i.key = "IntakeAmount"; i.label = "Intake effect (%)";
+        i.kind = FH3_SETTING_SLIDER; i.min = 0; i.max = 200; i.step = 10; i.slider_value = g_int_amount.load() * 100.0f; i.on_slide = on_slide;
+        api->add_setting(g_mod, &i);
+    }
 
     FH3Setting a{};
     a.size = sizeof a;

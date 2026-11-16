@@ -24,3 +24,6 @@ cmake -S . -B build -G Ninja -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_C_COMPILER=x86_
 cmake --build build
 ```
 Output: `build/EngineSoundTiers.dll`, to be put in `fh3-mods`.
+
+## 1.8.0: settings in the Tune Car > Engine tab
+Exhaust / intake sound type (0 = as installed, 1-4 = Stock/Street/Sport/Race, per car), exhaust and intake intensity (0-200), rasp (0-35), pipe resonance (0-200), extra pops (0-200). Only "Enabled" and "Effect on every car" stay on the Mods page.
