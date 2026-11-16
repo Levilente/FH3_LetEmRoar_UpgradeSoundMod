@@ -93,3 +93,6 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 
 ### 1.12.0
 - Air hiss reworked: it is made by exactly one effect instance at a time (before: once per intake track, a flat constant layer that never went away), and only from live physics (stops within 0.25 s in menus, pauses, or when the car can't be read).
+
+### 1.12.1
+- The turbo whistle no longer drops back to the game's quiet level after a while: its effect set is never taken over by newer tracks (a looping turbo sound is set up only once, so it looked "unused").

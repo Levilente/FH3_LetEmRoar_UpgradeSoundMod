@@ -781,7 +781,7 @@ void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) 
         }
 }
 
-struct Group { void* eq = nullptr; void* eq2 = nullptr; void* echo = nullptr; void* dist = nullptr; void* cdsp = nullptr; Dsp* cst = nullptr; unsigned serial = 0; uint64_t last = 0; };
+struct Group { void* eq = nullptr; void* eq2 = nullptr; void* echo = nullptr; void* dist = nullptr; void* cdsp = nullptr; Dsp* cst = nullptr; unsigned serial = 0; uint64_t last = 0; int cls = 0; };
 // FMOD is never asked about a group that may be gone (a stale handle crashed it): the number of effect sets is kept down by re-using the
 // set of the least recently used track for a new one (addDSP moves a DSP that is already in another chain).
 constexpr size_t kMaxSets = 48;
@@ -869,7 +869,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
             void* vk = nullptr;
             uint64_t vl = now;
             for (auto& kv : g_groups)
-                if (kv.first != grp && kv.second.eq && kv.second.last < vl && now - kv.second.last > 3000) { vl = kv.second.last; vk = kv.first; }
+                if (kv.first != grp && kv.second.eq && (kv.second.cls != 5 || now - kv.second.last > 600000) && kv.second.last < vl && now - kv.second.last > 3000) { vl = kv.second.last; vk = kv.first; }
             if (vk) { set = g_groups[vk]; g_groups.erase(vk); }
         }
         if (set.eq) {   // re-use the effects: they move to this group
@@ -895,6 +895,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
             void* eq2 = nullptr;
             if (fn<CreateDspFn>(kCreateDsp)(sys, kDspThreeEq, &eq2) == 0 && eq2 && fn<AddDspFn>(kAddDsp)(grp, 0, eq2) == 0) g.eq2 = eq2;
         }
+        g.cls = cls;
         const long n = g_n_groups.fetch_add(1) + 1;
         if (n <= 3 || n == 10 || n == 50) say("effect on %ld track(s) so far (this one: %s, level %d)", n, cls == 1 ? "exhaust" : (cls == 3 ? "granular synth" : (cls == 5 ? "turbo" : "engine bay / intake")), tier);
     } else if (g.serial == serial) {
@@ -903,6 +904,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
     }
     g.last = GetTickCount64();
     g.serial = serial;
+    g.cls = cls;
     const SetFloatFn setf = fn<SetFloatFn>(kSetFloat);
     setf(g.eq, 3, fx.x1);   // low/mid crossover
     setf(g.eq, 4, fx.x2);   // mid/high crossover
