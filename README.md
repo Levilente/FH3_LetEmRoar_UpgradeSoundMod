@@ -78,3 +78,6 @@ The turbo layers are split in two: spool / whistle / whine (events with Boost + 
 
 ### 1.11.8
 - The air hiss keeps going while the boost pressure is held even if the intake track itself falls silent on a lift.
+
+### 1.11.9
+- Air hiss for granular-engine cars too (their single engine track carries it).

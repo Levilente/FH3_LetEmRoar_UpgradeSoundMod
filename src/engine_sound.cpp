@@ -719,6 +719,8 @@ void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) 
                        al = 1.0f - std::exp(-6.2831853f * 700.0f / kSr);
     const float a1 = 1.0f - std::exp(-6.2831853f * b.x1 / kSr), a2 = 1.0f - std::exp(-6.2831853f * b.x2 / kSr), tb = ftanh(b.bias);
     Dsp& d = in.d;
+    const float airg = (g_fi_turbo.load() && g_enabled.load()) ? g_air.load() * 0.5f : 0.0f;   // the intake air hiss of a turbo car (a granular engine has one track: it goes in here)
+    static const float nlp = 1.0f - std::exp(-6.2831853f * 7000.0f / kSr), nhp = 1.0f - std::exp(-6.2831853f * 1500.0f / kSr);
     for (unsigned i = 0; i < frames; ++i)
         for (int c = 0; c < ch; ++c) {
             float x = buf[i * static_cast<unsigned>(ch) + static_cast<unsigned>(c)];
@@ -737,6 +739,13 @@ void process_block(Inst& in, float* buf, unsigned frames, int ch, const Blk& b) 
             float o = (y + b.mix * d.wl[c]) * b.gain;
             const float ao = o < 0 ? -o : o;
             if (ao > b.limit) o = (o < 0 ? -1.0f : 1.0f) * (b.limit + (1.0f - b.limit) * ftanh((ao - b.limit) / (1.0f - b.limit)));
+            if (airg > 0) {
+                d.rng ^= d.rng << 13; d.rng ^= d.rng >> 17; d.rng ^= d.rng << 5;
+                const float nz = static_cast<float>(d.rng & 0xFFFF) / 32768.0f - 1.0f;
+                d.nl[c] += nlp * (nz - d.nl[c]);
+                d.nh[c] += nhp * (d.nl[c] - d.nh[c]);
+                o += (d.nl[c] - d.nh[c]) * airg;
+            }
             buf[i * static_cast<unsigned>(ch) + static_cast<unsigned>(c)] = o;
         }
 }
