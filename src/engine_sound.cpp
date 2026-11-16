@@ -133,6 +133,7 @@ std::atomic<float> g_thr{0.0f};
 std::atomic<float> g_rpm_peak{0.0f};
 constexpr size_t kCarIface = 0x71E8, kIfaceToDyn = 0x4B0, kDynThrottle = 0x1BD0, kDynOmega = 0x5F8;   // as the Anti-Lag mod reads them
 std::atomic<int> g_bank_pg{-1}, g_bank_gs{-1};
+bool g_no_graph = false;
 std::atomic<uint64_t> g_hud_tick{0}, g_busy_until{0};   // the HUD ticks every frame in the world, never on a loading screen
 std::atomic<long> g_dc[5]{};   // diagnostics for the driven car: plays classified as other / exhaust / engine bay
 std::atomic<uint64_t> g_dnext{0};
@@ -658,6 +659,7 @@ void drain() {
     }
     for (const Req& r : work) {
         const uint64_t now = GetTickCount64();
+        if (g_no_graph) continue;
         if (now - r.t > 150) continue;                                            // stale: the group may be gone
         if (now - g_hud_tick.load() > 1500 || now < g_busy_until.load()) continue;   // the game is loading
         std::unique_lock gl{g_gmu, std::try_to_lock};
@@ -758,16 +760,21 @@ DWORD WINAPI worker(LPVOID) {
             return 0;
         }
     }
-    FH3Hook* h1 = g_api->hook_function(g_mod, "FMOD System::createSound (Engine Sound Tiers: which sample is exhaust / intake)", base + kCreateSound,
-                                       reinterpret_cast<void*>(&detour_create), reinterpret_cast<void**>(&g_orig_create));
-    FH3Hook* h2 = g_api->hook_function(g_mod, "Studio sound instrument play (Engine Sound Tiers: the effect)", base + kStudioPlay,
-                                       reinterpret_cast<void*>(&detour_play), reinterpret_cast<void**>(&g_orig_play));
-    FH3Hook* h4 = g_api->hook_function(g_mod, "FMOD System::playSound (Engine Sound Tiers: the granular engine synth)", base + kPlaySound,
-                                       reinterpret_cast<void*>(&detour_play2), reinterpret_cast<void**>(&g_orig_play2));
-    FH3Hook* h5 = g_api->hook_function(g_mod, "PG Engine Synth read (Engine Sound Tiers: granular engines)", base + kSynthRead,
-                                       reinterpret_cast<void*>(&detour_synth), reinterpret_cast<void**>(&g_orig_synth));
-    FH3Hook* h3 = g_api->hook_function(g_mod, "HUD controller (Engine Sound Tiers: the driven car's parts)", base + kHud,
-                                       reinterpret_cast<void*>(&detour_hud), reinterpret_cast<void**>(&g_orig_hud));
+    // Diagnostic switch (EngineSoundTiers.ini, Skip=): a sum of 1 createSound, 2 Studio play, 4 playSound, 8 synth, 16 HUD hooks to leave out
+    // (to find which part of this mod a freeze comes from); 32 = make no changes to the sound graph.
+    const int skip = ini_int(L"Skip", 0);
+    if (skip) say("diagnostic: Skip=%d (hooks left out: %s%s%s%s%s%s)", skip, skip & 1 ? "createSound " : "", skip & 2 ? "studio-play " : "", skip & 4 ? "playSound " : "",
+                  skip & 8 ? "synth " : "", skip & 16 ? "HUD " : "", skip & 32 ? "no-graph" : "");
+    g_no_graph = (skip & 32) != 0;
+    auto hk = [&](int bit, const char* nm, uintptr_t rva, void* det, void** orig) -> FH3Hook* {
+        if (skip & bit) return reinterpret_cast<FH3Hook*>(1);
+        return g_api->hook_function(g_mod, nm, base + rva, det, orig);
+    };
+    FH3Hook* h1 = hk(1, "FMOD System::createSound (Engine Sound Tiers: which sample is exhaust / intake)", kCreateSound, reinterpret_cast<void*>(&detour_create), reinterpret_cast<void**>(&g_orig_create));
+    FH3Hook* h2 = hk(2, "Studio sound instrument play (Engine Sound Tiers: the effect)", kStudioPlay, reinterpret_cast<void*>(&detour_play), reinterpret_cast<void**>(&g_orig_play));
+    FH3Hook* h4 = hk(4, "FMOD System::playSound (Engine Sound Tiers: the granular engine synth)", kPlaySound, reinterpret_cast<void*>(&detour_play2), reinterpret_cast<void**>(&g_orig_play2));
+    FH3Hook* h5 = hk(8, "PG Engine Synth read (Engine Sound Tiers: granular engines)", kSynthRead, reinterpret_cast<void*>(&detour_synth), reinterpret_cast<void**>(&g_orig_synth));
+    FH3Hook* h3 = hk(16, "HUD controller (Engine Sound Tiers: the driven car's parts)", kHud, reinterpret_cast<void*>(&detour_hud), reinterpret_cast<void**>(&g_orig_hud));
     if (!h1 || !h2 || !h3 || !h4 || !h5 || !g_api->enable_hooks(g_mod, nullptr)) {
         say("could not place the hooks (see the lines above): doing nothing");
         g_api->disable_hooks(g_mod, nullptr);
