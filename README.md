@@ -33,3 +33,6 @@ Every Engine-tab setting (sound types, intensities, rasp, pipe resonance, pops) 
 
 ## 1.8.2
 Load timing: after every loading screen (HUD silent for over 3 s) one log line says how long it was and how much time our hooks spent inside the game's own function and in our own code (per hook, with the longest single call). To trace a slow load.
+
+## 1.9.0: turbo / boost sounds
+The turbo layers (spool, whistle, flutter: the samples of the sub-events driven by the Boost parameter) are recognised separately (bank_tiers.inc has a third mask; tools/tiers_table.py generates it) and get their own effect per level: brighter, louder, with a soft long echo so they float. Engine tab: "Turbo / boost sound (%)" 0-200, per car. The level follows the higher of intake / exhaust for now; the log line "car part ids from Car+0x70E0" is for finding the forced induction slot.

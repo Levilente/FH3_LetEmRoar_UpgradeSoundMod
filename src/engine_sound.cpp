@@ -30,7 +30,7 @@
 
 namespace {
 
-struct BankTier { uint32_t off, len; uint64_t exh[8], eng[8]; const char* name; };
+struct BankTier { uint32_t off, len; uint64_t exh[8], eng[8], tur[8]; const char* name; };
 struct EngineMap { const char* media; const char* engine; const char* granular; };
 #include "bank_tiers.inc"
 #include "engine_map.inc"
@@ -103,6 +103,8 @@ std::atomic<float> g_int_amount{1.0f};
 std::atomic<float> g_rasp{0.25f};
 std::atomic<float> g_pops{1.0f};         // 0 .. 2, extra backfire pops
 std::atomic<float> g_pipe{1.0f};        // pipe resonance amount 0 .. 2 (short echo on the Sport / Race exhaust)
+std::atomic<float> g_tur_amount{1.0f};     // turbo / boost layers' effect 0 .. 2
+std::atomic<int> g_tur_tier{0};
 std::atomic<int> g_ov_exh{0}, g_ov_int{0};   // the driven car's chosen sound type: 0 = as installed, 1..4 = Stock / Street / Sport / Race
 std::atomic<int> g_all_cars{0};         // also other cars that use the same sound bank (they do anyway); 1 = every car on the road
 std::atomic<unsigned> g_cfg_serial{1};  // bumped when anything that changes the effect changes
@@ -130,7 +132,7 @@ void on_slide(void*, const char* key, float value) {
 
 std::atomic<int> g_exh_tier{0}, g_int_tier{0};
 // ---- the Engine tab's settings, saved per car -------------------------------------------------------------------------------
-struct CarCfg { int e = 0, i = 0, ea = 100, ia = 100, rasp = 25, pipe = 100, pops = 100; };   // sound types (0 = as installed), then percents
+struct CarCfg { int e = 0, i = 0, ea = 100, ia = 100, rasp = 25, pipe = 100, pops = 100, ta = 100; };   // sound types (0 = as installed), then percents
 CarCfg g_def;   // what a car without its own entry gets (the old global ini values)
 std::mutex g_selmu;
 std::unordered_map<uint32_t, CarCfg> g_sel;   // garage id -> its settings
@@ -142,7 +144,7 @@ CarCfg cfg_of(uint32_t garage) {
 }
 void cfg_apply(const CarCfg& c) {   // make it the settings in force (the driven car's)
     const bool ch = g_ov_exh.exchange(c.e) != c.e | g_ov_int.exchange(c.i) != c.i;
-    g_exh_amount = c.ea / 100.0f; g_int_amount = c.ia / 100.0f; g_rasp = c.rasp / 100.0f; g_pipe = c.pipe / 100.0f; g_pops = c.pops / 100.0f;
+    g_exh_amount = c.ea / 100.0f; g_int_amount = c.ia / 100.0f; g_rasp = c.rasp / 100.0f; g_pipe = c.pipe / 100.0f; g_pops = c.pops / 100.0f; g_tur_amount = c.ta / 100.0f;
     if (ch) g_cfg_serial.fetch_add(1);
 }
 void sel_refresh(uint32_t garage) { cfg_apply(cfg_of(garage)); g_cfg_serial.fetch_add(1); }
@@ -152,14 +154,14 @@ void sel_load() {
     for (const wchar_t* q = buf; *q; q += wcslen(q) + 1) {
         unsigned id = 0;
         CarCfg c = g_def;
-        const int n = swscanf(q, L"%u=%d,%d,%d,%d,%d,%d,%d", &id, &c.e, &c.i, &c.ea, &c.ia, &c.rasp, &c.pipe, &c.pops);
+        const int n = swscanf(q, L"%u=%d,%d,%d,%d,%d,%d,%d,%d", &id, &c.e, &c.i, &c.ea, &c.ia, &c.rasp, &c.pipe, &c.pops, &c.ta);
         if (n < 3 || !id) continue;
         auto cl = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
-        c.e = cl(c.e, 0, 4); c.i = cl(c.i, 0, 4); c.ea = cl(c.ea, 0, 200); c.ia = cl(c.ia, 0, 200); c.rasp = cl(c.rasp, 0, 35); c.pipe = cl(c.pipe, 0, 200); c.pops = cl(c.pops, 0, 200);
+        c.e = cl(c.e, 0, 4); c.i = cl(c.i, 0, 4); c.ea = cl(c.ea, 0, 200); c.ia = cl(c.ia, 0, 200); c.rasp = cl(c.rasp, 0, 35); c.pipe = cl(c.pipe, 0, 200); c.pops = cl(c.pops, 0, 200); c.ta = cl(c.ta, 0, 200);
         g_sel[id] = c;
     }
 }
-// field: 0 exhaust type, 1 intake type, 2 exhaust %, 3 intake %, 4 rasp, 5 pipe, 6 pops
+// field: 0 exhaust type, 1 intake type, 2 exhaust %, 3 intake %, 4 rasp, 5 pipe, 6 pops, 7 turbo %
 void sel_set(int field, int v) {
     const uint32_t id = cur_garage();
     if (!id) return;
@@ -168,21 +170,23 @@ void sel_set(int field, int v) {
         std::lock_guard<std::mutex> l(g_selmu);
         auto it = g_sel.find(id);
         c = it == g_sel.end() ? g_def : it->second;
-        int* f[7] = {&c.e, &c.i, &c.ea, &c.ia, &c.rasp, &c.pipe, &c.pops};
+        int* f[8] = {&c.e, &c.i, &c.ea, &c.ia, &c.rasp, &c.pipe, &c.pops, &c.ta};
         *f[field] = v;
         g_sel[id] = c;
     }
-    wchar_t k[16], t[96];
+    wchar_t k[16], t[112];
     _snwprintf(k, 16, L"%u", id);
-    _snwprintf(t, 96, L"%d,%d,%d,%d,%d,%d,%d", c.e, c.i, c.ea, c.ia, c.rasp, c.pipe, c.pops);
+    _snwprintf(t, 112, L"%d,%d,%d,%d,%d,%d,%d,%d", c.e, c.i, c.ea, c.ia, c.rasp, c.pipe, c.pops, c.ta);
     WritePrivateProfileStringW(L"Cars", k, t, g_ini);
     sel_refresh(id);
 }
 float sel_get(int field) {
     const CarCfg c = cfg_of(cur_garage());
-    const int f[7] = {c.e, c.i, c.ea, c.ia, c.rasp, c.pipe, c.pops};
+    const int f[8] = {c.e, c.i, c.ea, c.ia, c.rasp, c.pipe, c.pops, c.ta};
     return static_cast<float>(f[field]);
 }
+// the turbo / boost layers' level (the forced induction part; until its slot in the car is known: the higher of intake and exhaust)
+int eff_turbo_tier() { return g_enabled.load() ? g_tur_tier.load() : 0; }
 // the tier to use for the driven car's exhaust (exh) or intake
 int eff_tier(int exh) {
     int t = exh ? g_exh_tier.load() : g_int_tier.load();
@@ -202,7 +206,7 @@ bool g_no_graph = false, g_no_own_dsp = false, g_no_echo = false;
 std::atomic<uint64_t> g_hud_tick{0}, g_busy_until{0};   // the HUD ticks every frame in the world, never on a loading screen
 std::atomic<long> g_grp_new{0}, g_grp_reuse{0};   // groups given an effect: new pointers / pointers seen before
 std::atomic<long> g_n_released{0};
-std::atomic<long> g_dc[5]{};   // diagnostics for the driven car: plays classified as other / exhaust / engine bay
+std::atomic<long> g_dc[6]{};   // diagnostics for the driven car: plays classified as other / exhaust / engine bay
 std::atomic<uint64_t> g_dnext{0};
 std::atomic<long> g_n_groups{0}, g_n_err{0};   // rows of kBankTier of the driven car's banks, -1 = not known
 
@@ -281,6 +285,7 @@ void car_seen(char* car) {
     auto tier = [](int32_t v) { if (v < 0) return 0; const int t = v % 1000; return t > 3 ? 3 : t; };
     g_exh_tier = tier(ex);
     g_int_tier = tier(in);
+    g_tur_tier = g_exh_tier.load() > g_int_tier.load() ? g_exh_tier.load() : g_int_tier.load();   // until the forced induction slot is known
     const char* engine = name;
     const char* gran = nullptr;
     for (const EngineMap& m : kEngineMap)
@@ -297,6 +302,14 @@ void car_seen(char* car) {
     say("driven car: engine sound \"%s\" (bank %s%s%s), exhaust part %d -> level %d, intake part %d -> level %d", name,
         pg >= 0 ? kBankTier[pg].name : "not found", gs >= 0 ? " + " : "", gs >= 0 ? kBankTier[gs].name : "", ex, g_exh_tier.load(), in,
         g_int_tier.load());
+    {   // the car's installed part ids around the exhaust / intake slots (to find the forced induction slot)
+        int32_t v[40] = {};
+        char line[600];
+        int o = _snprintf(line, sizeof line, "car part ids from Car+0x70E0:");
+        if (rd(car + 0x70E0, v, sizeof v))
+            for (int i = 0; i < 40 && o > 0 && o < 540; ++i) o += _snprintf(line + o, sizeof line - o, " %d", v[i]);
+        say("%s", line);
+    }
 }
 
 uint64_t detour_hud(void* c, void* a, void* b, void* d) {
@@ -429,6 +442,7 @@ int classify(void* snd, int* row) {
         for (int j = 0; j < bf.cnt; ++j)
             if (bf.idx[j] == m.idx) return 4;
     }
+    if (b.tur[m.idx >> 6] >> (m.idx & 63) & 1) return 5;   // turbo / boost layer
     if (b.exh[m.idx >> 6] >> (m.idx & 63) & 1) return 1;
     if (b.eng[m.idx >> 6] >> (m.idx & 63) & 1) return 2;
     return 0;
@@ -448,6 +462,13 @@ struct Fx {
     float echo_ms, echo_wet, echo_fb;   // pipe resonance: delay, wet level in dB (<= -80: none), feedback %
     float dist;                     // distortion level (scaled by the Rasp slider)
 };
+// Turbo / boost layers (spool, whistle, flutter): the tilt EQ's top part opens up, a band around the whistle, and a long soft echo makes them float.
+// Levels follow the forced induction upgrade. Fields: low, mid, high, x1, x2, band, b1, b2, echo_ms, echo_wet, echo_fb, dist.
+const Fx kTurFx[4] = {
+    {0, 0, 0, 1200, 3000, 0, 3000, 8000, 60, -80, 0, 0},
+    {0, 1.5f, 3.0f, 1200, 3000, 1.5f, 3000, 8000, 55, -22, 25, 0},
+    {0, 2.5f, 5.0f, 1200, 3000, 2.5f, 3000, 8000, 70, -17, 35, 0},
+    {0, 3.5f, 7.0f, 1200, 3000, 3.5f, 3000, 8000, 85, -13, 45, 0}};
 // Exhaust: stock; sport rear muffler; sport rear + middle muffler; open straight-through system.
 const Fx kExhFx[4] = {
     {0, 0, 0, 250, 2500, 0, 700, 1800, 12, -80, 0, 0},
@@ -616,7 +637,13 @@ void apply(void* sys, void* grp, int cls, bool gran) {
     };
     int tier;
     Fx fx;
-    if (cls == 3) {   // a granular engine's synthesised sound: exhaust and intake in one track -> the exhaust's shape, some of the intake's tilt
+    if (cls == 5) {   // turbo / boost
+        tier = eff_turbo_tier();
+        const float ta = g_tur_amount.load();
+        fx = kTurFx[tier];
+        fx.mid *= ta; fx.high *= ta; fx.band *= ta;
+        if (ta <= 0.01f || tier == 0) fx.echo_wet = -80; else fx.echo_wet += 8.0f * (ta - 1.0f);
+    } else if (cls == 3) {   // a granular engine's synthesised sound: exhaust and intake in one track -> the exhaust's shape, some of the intake's tilt
         const int te = pick(1), ti = pick(0);
         tier = te > ti ? te : ti;
         const Fx i = scaled(kIntFx[ti], g_int_amount.load());
@@ -631,13 +658,14 @@ void apply(void* sys, void* grp, int cls, bool gran) {
     {
         const float rasp = clampf(g_rasp.load() * 4.0f, 0, 2.5f);
         auto sdp = [&](const Dp& d, float a) { return Dp{d.k * a, d.drive, d.mix * a * rasp, d.bias, d.gain_db * a}; };
-        if (cls == 3) {
+        if (cls == 5) dp = Dp{0, 1, 0, 0, 0};
+        else if (cls == 3) {
             const Dp e = sdp(kExhDp[pick(1)], g_exh_amount.load()), i = sdp(kIntDp[pick(0)], g_int_amount.load());
             dp = Dp{e.k * 0.6f + i.k * 0.4f, e.drive > i.drive ? e.drive : i.drive, e.mix * 0.6f + i.mix * 0.4f, e.bias, e.gain_db * 0.6f + i.gain_db * 0.4f};
         } else dp = sdp((cls == 1 ? kExhDp : kIntDp)[tier], cls == 1 ? g_exh_amount.load() : g_int_amount.load());
         dp.k = clampf(dp.k, 0, 1.5f); dp.mix = clampf(dp.mix, 0, 1.2f); dp.gain_db = clampf(dp.gain_db, 0, 6);
     }
-    const bool dp_on = !g_no_own_dsp && !gran && (dp.k > 0 || dp.mix > 0 || dp.gain_db > 0);   // granular cars: the EQ only (their loading stuck with our own effect)
+    const bool dp_on = !g_no_own_dsp && !gran && cls != 5 && (dp.k > 0 || dp.mix > 0 || dp.gain_db > 0);   // granular cars: the EQ only (their loading stuck with our own effect)
     fx.low = clampf(fx.low, 0, 10); fx.mid = clampf(fx.mid, 0, 10); fx.high = clampf(fx.high, 0, 10); fx.band = clampf(fx.band, 0, 10);
     fx.dist = clampf(fx.dist, 0, 0.6f); fx.echo_wet = clampf(fx.echo_wet, -80, -6);
     const bool nothing = !dp_on && fx.low == 0 && fx.mid == 0 && fx.high == 0 && fx.band == 0 && fx.echo_wet <= -80;
@@ -691,7 +719,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
             if (fn<CreateDspFn>(kCreateDsp)(sys, kDspThreeEq, &eq2) == 0 && eq2 && fn<AddDspFn>(kAddDsp)(grp, 0, eq2) == 0) g.eq2 = eq2;
         }
         const long n = g_n_groups.fetch_add(1) + 1;
-        if (n <= 3 || n == 10 || n == 50) say("effect on %ld track(s) so far (this one: %s, level %d)", n, cls == 1 ? "exhaust" : (cls == 3 ? "granular synth" : "engine bay / intake"), tier);
+        if (n <= 3 || n == 10 || n == 50) say("effect on %ld track(s) so far (this one: %s, level %d)", n, cls == 1 ? "exhaust" : (cls == 3 ? "granular synth" : (cls == 5 ? "turbo" : "engine bay / intake")), tier);
     } else if (g.serial == serial) {
         g.last = GetTickCount64();
         return;
@@ -719,7 +747,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
         }
     }
     if (g.echo) {   // FMOD Echo: 0 delay ms (10..), 1 feedback %, 2 dry level dB, 3 wet level dB
-        setf(g.echo, 0, clampf(fx.echo_ms, 10, 40));
+        setf(g.echo, 0, clampf(fx.echo_ms, 10, cls == 5 ? 120 : 40));
         setf(g.echo, 1, fx.echo_wet > -80 ? fx.echo_fb : 0);
         setf(g.echo, 2, 0);
         setf(g.echo, 3, fx.echo_wet);
@@ -1073,6 +1101,9 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
             {sizeof(FH3TuningRow), "PipeAmount", "Engine sound|Pipe resonance (%)",
              "The hollow ring of a freer exhaust pipe on the Sport and Race exhaust. 0 is none, 100 is the mod's own, 200 is double.",
              0, 200, 5, 0, [](void*) { return sel_get(5); }, [](void*, float v) { sel_set(5, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
+            {sizeof(FH3TuningRow), "TurboAmount", "Engine sound|Turbo / boost sound (%)",
+             "Spool, whistle and flutter of the turbo: louder, brighter and floatier with a better turbo. 0 is none, 100 is the mod's own, 200 is double.",
+             0, 200, 5, 0, [](void*) { return sel_get(7); }, [](void*, float v) { sel_set(7, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
             {sizeof(FH3TuningRow), "Pops", "Engine sound|Extra exhaust pops (%)",
              "How much more the exhaust pops and crackles on a lift with better exhaust parts. 0 is none, 200 is double.",
              0, 200, 5, 0, [](void*) { return sel_get(6); }, [](void*, float v) { sel_set(6, static_cast<int>(v + 0.5f)); }, nullptr, nullptr, "Engine"},
