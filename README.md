@@ -30,3 +30,6 @@ Exhaust / intake sound type (0 = as installed, 1-4 = Stock/Street/Sport/Race, pe
 
 ## 1.8.1
 Every Engine-tab setting (sound types, intensities, rasp, pipe resonance, pops) is saved per car (ini section [Cars], key = garage id).
+
+## 1.8.2
+Load timing: after every loading screen (HUD silent for over 3 s) one log line says how long it was and how much time our hooks spent inside the game's own function and in our own code (per hook, with the longest single call). To trace a slow load.

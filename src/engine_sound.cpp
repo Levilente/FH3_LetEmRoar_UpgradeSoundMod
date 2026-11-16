@@ -206,6 +206,51 @@ std::atomic<long> g_dc[5]{};   // diagnostics for the driven car: plays classifi
 std::atomic<uint64_t> g_dnext{0};
 std::atomic<long> g_n_groups{0}, g_n_err{0};   // rows of kBankTier of the driven car's banks, -1 = not known
 
+// ---- timing of our hooks (to trace a slow load): time inside the game's own function vs. in our code ------------------------
+int64_t now_us() {
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+    return c.QuadPart * 1000000 / f.QuadPart;
+}
+struct Stat {
+    std::atomic<long> n{0};
+    std::atomic<long long> orig{0}, own{0};
+    std::atomic<long> max_orig{0}, max_own{0};
+};
+enum { S_CREATE, S_PLAY, S_PLAY2, S_SYNTH, S_HUD, S_APPLY, S_COUNT };
+const char* const kStName[S_COUNT] = {"createSound", "studio play", "playSound", "synth", "HUD", "effect set-up"};
+Stat g_st[S_COUNT];
+thread_local int64_t t_orig = 0;
+void st_max(std::atomic<long>& m, long v) { long o = m.load(); while (v > o && !m.compare_exchange_weak(o, v)) {} }
+struct Tm {
+    Stat& s; int64_t t0;
+    explicit Tm(Stat& st) : s(st), t0(now_us()) { t_orig = 0; }
+    ~Tm() {
+        const int64_t tot = now_us() - t0, o = t_orig, w = tot > o ? tot - o : 0;
+        s.n.fetch_add(1); s.orig.fetch_add(o); s.own.fetch_add(w);
+        st_max(s.max_orig, static_cast<long>(o)); st_max(s.max_own, static_cast<long>(w));
+    }
+};
+template <class F> auto orig_timed(F&& f) {
+    const int64_t a = now_us();
+    auto r = f();
+    t_orig += now_us() - a;
+    return r;
+}
+// one line per load: how long the HUD was silent, and what our hooks did in that time (game's own call / our code, ms; longest single call, ms)
+void st_report(double gap_s) {
+    char b[700];
+    int o = _snprintf(b, sizeof b, "load of %.1f s; in our hooks (calls: in the game's own function / in our code, ms; longest call):", gap_s);
+    for (int i = 0; i < S_COUNT && o > 0 && o < 600; ++i) {
+        Stat& t = g_st[i];
+        const long n = t.n.exchange(0);
+        const double go = static_cast<double>(t.orig.exchange(0)) / 1000.0, ow = static_cast<double>(t.own.exchange(0)) / 1000.0;
+        const double mo = t.max_orig.exchange(0) / 1000.0, mw = t.max_own.exchange(0) / 1000.0;
+        if (n) o += _snprintf(b + o, sizeof b - o, " | %s %ld: %.0f / %.0f (max %.0f / %.0f)", kStName[i], n, go, ow, mo, mw);
+    }
+    say("%s", b);
+}
+
 int bank_row(const char* name) {
     for (int i = 0; i < kBanks; ++i)
         if (!_stricmp(kBankTier[i].name, name)) return i;
@@ -255,8 +300,13 @@ void car_seen(char* car) {
 }
 
 uint64_t detour_hud(void* c, void* a, void* b, void* d) {
-    const uint64_t r = g_orig_hud(c, a, b, d);
-    g_hud_tick = GetTickCount64();
+    Tm tm(g_st[S_HUD]);
+    const uint64_t r = orig_timed([&] { return g_orig_hud(c, a, b, d); });
+    {
+        const uint64_t prev = g_hud_tick.load(), nw = GetTickCount64();
+        g_hud_tick = nw;
+        if (prev && nw - prev > 3000) st_report((nw - prev) / 1000.0);
+    }
     {   // throttle and revs of the driven car, every frame
         char* car = nullptr;
         void* cb  = nullptr;
@@ -316,7 +366,8 @@ std::atomic<int> g_user_logged{0};
 
 int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex, void** out) {
     g_n_create.fetch_add(1);
-    const int r = g_orig_create(sys, name, mode, ex, out);
+    Tm tm(g_st[S_CREATE]);
+    const int r = orig_timed([&] { return g_orig_create(sys, name, mode, ex, out); });
     // The Anti-Lag mod's pop samples are raw PCM held in memory (OPENMEMORY | OPENRAW); the game's bank samples never are. (The caller's
     // module can not be used: with chained hooks every call may appear to come from the Anti-Lag mod.)
     if (r == 0 && out && *out && g_antilag_mod && (mode & 0x800) && (mode & 0x1000)) {
@@ -695,7 +746,8 @@ void apply(void* sys, void* grp, int cls, bool gran) {
 float db2lin(float db) { return std::pow(10.0f, db / 20.0f); }
 int synth_tier(int exh) { return eff_tier(exh); }
 int detour_synth(void* st, float* in, float* out, unsigned length, int inch, int* outch) {
-    const int r = g_orig_synth(st, in, out, length, inch, outch);
+    Tm tm(g_st[S_SYNTH]);
+    const int r = orig_timed([&] { return g_orig_synth(st, in, out, length, inch, outch); });
     int ch = outch ? *outch : inch;
     if (r != 0 || !out || length == 0 || length > 4096 || ch < 1 || ch > 8) return r;
     const int te = synth_tier(1), ti = synth_tier(0);
@@ -771,6 +823,7 @@ void drain() {
         const auto t0 = std::chrono::steady_clock::now();
         apply(r.sys, r.grp, r.cls, r.gran);
         const long us = static_cast<long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+        g_st[S_APPLY].n.fetch_add(1); g_st[S_APPLY].own.fetch_add(us); st_max(g_st[S_APPLY].max_own, us);
         g_n_apply.fetch_add(1);
         long m = g_apply_max_us.load();
         while (us > m && !g_apply_max_us.compare_exchange_weak(m, us)) {}
@@ -778,7 +831,8 @@ void drain() {
 }
 
 int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
-    const int r = g_orig_play(snd, sys, grp, paused, a5, ch);
+    Tm tm(g_st[S_PLAY]);
+    const int r = orig_timed([&] { return g_orig_play(snd, sys, grp, paused, a5, ch); });
     g_n_play.fetch_add(1);
     if (r != 0 || !snd || !sys || !grp) return r;
     int row = -1, cls = 0;
@@ -804,7 +858,7 @@ int detour_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch)
         if (p > 0 && now - last.load() > 45 && rnd() < p) {
             last.store(now);
             void* ch2 = nullptr;
-            if (g_orig_play(snd, sys, grp, paused, a5, &ch2) == 0 && ch2) {
+            if (orig_timed([&] { return g_orig_play(snd, sys, grp, paused, a5, &ch2); }) == 0 && ch2) {
                 fn<SetCtlFloatFn>(kSetPitch)(ch2, 0.90f + 0.20f * rnd());
                 fn<SetCtlFloatFn>(kSetVolume)(ch2, 0.55f + 0.30f * rnd());
                 static std::atomic<int> logged{0};
@@ -833,7 +887,8 @@ PlaySoundFn g_orig_play2 = nullptr;
 std::atomic<int> g_play2_logged{0};
 
 int detour_play2(void* sys, void* snd, void* grp, bool paused, void** ch) {
-    const int r = g_orig_play2(sys, snd, grp, paused, ch);
+    Tm tm(g_st[S_PLAY2]);
+    const int r = orig_timed([&] { return g_orig_play2(sys, snd, grp, paused, ch); });
     if (r != 0 || !snd || !sys || !grp) return r;
     bool user;
     {
