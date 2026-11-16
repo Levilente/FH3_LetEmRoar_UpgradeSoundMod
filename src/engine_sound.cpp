@@ -350,7 +350,7 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
         const uint64_t dn = g_dnext.load();
         if (dn && now > dn) {
             g_dnext = now + 60000;
-            say("sounds of the driven car so far: exhaust %ld, engine bay %ld, other %ld (tracks with effect: %ld = %ld new groups + %ld seen before; %ld effect sets re-used); throttle %.2f, load %.2f, rev peak %.0f", g_dc[1].load(), g_dc[2].load(), g_dc[0].load(), g_n_groups.load(), g_grp_new.load(), g_grp_reuse.load(), g_n_released.load(), g_thr.load(), g_load.load(), g_rpm_peak.load());
+            say("sounds of the driven car so far: exhaust %ld, engine bay %ld, turbo %ld, other %ld (tracks with effect: %ld = %ld new groups + %ld seen before; %ld effect sets re-used); throttle %.2f, load %.2f, rev peak %.0f", g_dc[1].load(), g_dc[2].load(), g_dc[5].load(), g_dc[0].load(), g_n_groups.load(), g_grp_new.load(), g_grp_reuse.load(), g_n_released.load(), g_thr.load(), g_load.load(), g_rpm_peak.load());
         }
     }
     if (g_api->upgrade_active_garage) {   // the driven (or tuned) car's sound type choice
@@ -465,10 +465,10 @@ struct Fx {
 // Turbo / boost layers (spool, whistle, flutter): airy, not echoing: the top end opens up (breath, hiss, whistle) with the level, no delay.
 // Levels follow the forced induction upgrade. Fields: low, mid, high, x1, x2, band, b1, b2, echo_ms, echo_wet, echo_fb, dist.
 const Fx kTurFx[4] = {
-    {0, 0, 0, 1500, 5000, 0, 5000, 11000, 60, -80, 0, 0},
-    {0, 1.0f, 3.5f, 1500, 5000, 1.5f, 5000, 11000, 60, -80, 0, 0},
-    {0, 1.5f, 6.0f, 1500, 5000, 3.0f, 5000, 11000, 60, -80, 0, 0},
-    {0, 2.0f, 8.0f, 1500, 5000, 4.5f, 5000, 11000, 60, -80, 0, 0}};
+    {0, 0, 0, 1000, 4500, 0, 4500, 11000, 60, -80, 0, 0},
+    {1.5f, 3.0f, 5.0f, 1000, 4500, 2.5f, 4500, 11000, 60, -80, 0, 0},
+    {3.0f, 5.0f, 8.0f, 1000, 4500, 4.5f, 4500, 11000, 60, -80, 0, 0},
+    {4.5f, 7.0f, 10.0f, 1000, 4500, 6.0f, 4500, 11000, 60, -80, 0, 0}};
 // Exhaust: stock; sport rear muffler; sport rear + middle muffler; open straight-through system.
 const Fx kExhFx[4] = {
     {0, 0, 0, 250, 2500, 0, 700, 1800, 12, -80, 0, 0},
@@ -641,7 +641,7 @@ void apply(void* sys, void* grp, int cls, bool gran) {
         tier = eff_turbo_tier();
         const float ta = g_tur_amount.load();
         fx = kTurFx[tier];
-        fx.mid *= ta; fx.high *= ta; fx.band *= ta;
+        fx.low *= ta; fx.mid *= ta; fx.high *= ta; fx.band *= ta;
         if (ta <= 0.01f || tier == 0) fx.echo_wet = -80; else fx.echo_wet += 8.0f * (ta - 1.0f);
     } else if (cls == 3) {   // a granular engine's synthesised sound: exhaust and intake in one track -> the exhaust's shape, some of the intake's tilt
         const int te = pick(1), ti = pick(0);

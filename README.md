@@ -39,3 +39,6 @@ The turbo layers (spool, whistle, flutter: the samples of the sub-events driven 
 
 ## 1.9.1
 Turbo / boost layers: airier instead of echoing (the top end opens with the level, no delay).
+
+## 1.9.2
+Turbo layers: much stronger lift (+4.5 / +7 / +10 dB at Race), the 60 s diagnostics line counts the turbo samples played.
